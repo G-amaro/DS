@@ -1,0 +1,153 @@
+classDiagram
+    direction LR
+
+    class SignatureScheme {
+        <<interface>>
+        +generateKeyPair() KeyPair
+        +sign(privateKey, data) bytes
+        +verify(publicKey, data, signature) bool
+    }
+    class Ed25519Scheme
+    SignatureScheme <|.. Ed25519Scheme
+
+    class ReportContent {
+        +UUID report_id
+        +IncidentType incident_type
+        +Indicators indicators
+        +ObservationPeriod observation_period
+        +Severity severity
+        +Mitigation recommended_mitigation
+    }
+    class Indicators {
+        +List~string~ source_prefixes
+        +List~int~ source_asns
+        +List~int~ destination_ports
+        +List~string~ protocols
+    }
+    class ObservationPeriod {
+        +datetime start
+        +datetime end
+    }
+    class IncidentType {
+        <<enumeration>>
+        ddos
+        scanning
+        botnet_c2
+        prefix_hijacking
+        other
+    }
+    class Severity {
+        <<enumeration>>
+        low
+        medium
+        high
+        critical
+    }
+    class Mitigation {
+        <<enumeration>>
+        rate_limiting
+        blackholing
+        filtering
+        monitoring
+    }
+    ReportContent *-- Indicators
+    ReportContent *-- ObservationPeriod
+    ReportContent --> IncidentType
+    ReportContent --> Severity
+    ReportContent --> Mitigation
+
+    class Vault {
+        +bytes ciphertext
+    }
+    class Credential {
+        +int epoch_id
+        +bytes pk_ep
+        +bytes coordinator_signature
+    }
+    class TimestampToken {
+        +bytes digest
+        +datetime time
+        +bytes tsa_signature
+    }
+    class ReportEnvelope {
+        +int epoch_id
+        +bytes ciphertext
+        +bytes signature
+    }
+    class CorroborationEnvelope {
+        +UUID report_id
+        +int epoch_id
+        +bytes ciphertext
+        +bytes signature
+    }
+    class Verdict {
+        +UUID report_id
+        +string outcome
+        +bytes arbiter_signature
+    }
+    Credential *-- Vault
+    ReportEnvelope *-- Credential
+    ReportEnvelope *-- TimestampToken
+    CorroborationEnvelope *-- Credential
+    CorroborationEnvelope *-- TimestampToken
+    ReportEnvelope ..> ReportContent : cifra
+
+    class Member {
+        -bytes sk_login
+        -bytes sk_ep
+        -bytes epoch_key
+        -Credential credential
+        +login()
+        +requestCredential(epoch_id)
+        +readControl()
+        +publishReport(content)
+        +corroborate(report_id)
+        +verifyEnvelope(envelope) bool
+        +countCorroborations(report_id) int
+        +openDispute(envelope)
+    }
+    class Coordinator {
+        +enroll(member)
+        +issueCredential(member, pk_ep, epoch_id) Credential
+        +startEpoch()
+        +publishEpochKey()
+        +revoke(member)
+    }
+    class CertificateAuthority {
+        +issueServerCert(csr)
+        +issueLoginCert(csr)
+    }
+    class Gateway {
+        +accept(envelope)
+        +verifyCredential(credential) bool
+        +checkReplay(report_id) bool
+        +publish(envelope)
+    }
+    class TimestampAuthority {
+        +timestamp(digest) TimestampToken
+    }
+    class Arbiter {
+        +openVault(vault) string
+        +issueVerdict(report_id, outcome) Verdict
+    }
+    class KafkaBroker {
+        +topic reports
+        +topic corroborations
+        +topic control
+    }
+
+    Member --> Credential : guarda
+    Member ..> SignatureScheme : usa
+    Gateway ..> SignatureScheme : usa
+    Member ..> Coordinator : pede credencial
+    Member ..> Gateway : publica via Tor
+    Member ..> KafkaBroker : le
+    Member ..> Arbiter : abre disputa
+    Coordinator ..> Vault : cria
+    Coordinator ..> CertificateAuthority : pede certificado
+    Coordinator ..> KafkaBroker : publica chaves
+    Gateway ..> TimestampAuthority : pede timestamp
+    Gateway ..> KafkaBroker : publica
+    Arbiter ..> Vault : abre
+    Arbiter ..> Coordinator : entrega identidade
+    Arbiter ..> KafkaBroker : publica veredito

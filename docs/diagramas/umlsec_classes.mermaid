@@ -1,0 +1,73 @@
+classDiagram
+    direction LR
+
+    class EpochKey {
+        <<critical>>
+        +bytes K_ep
+    }
+    note for EpochKey "{secrecy = K_ep}\n{integrity = K_ep}"
+
+    class EphemeralKey {
+        <<critical>>
+        +bytes sk_ep
+        +bytes pk_ep
+    }
+    note for EphemeralKey "{secrecy = sk_ep}\n{integrity = pk_ep}"
+
+    class LoginKey {
+        <<critical>>
+        +bytes sk_login
+        +bytes pk_login
+    }
+    note for LoginKey "{secrecy = sk_login}\n{authenticity = pk_login}"
+
+    class Vault {
+        <<critical>>
+        +bytes ciphertext
+    }
+    note for Vault "{secrecy = ciphertext}\n{integrity = ciphertext}\nSo o Arbiter decifra"
+
+    class Credential {
+        <<critical>>
+        +int epoch_id
+        +bytes pk_ep
+        +bytes coordinator_signature
+    }
+    note for Credential "{integrity = epoch_id, pk_ep, vault}\n{authenticity = coordinator_signature}\n{freshness = epoch_id}"
+
+    class ReportEnvelope {
+        <<critical>>
+        +bytes ciphertext
+        +bytes signature
+        +int epoch_id
+    }
+    note for ReportEnvelope "{secrecy = ciphertext}\n{integrity = ciphertext, epoch_id}\n{authenticity = signature}\n{freshness = token}"
+
+    class TimestampToken {
+        <<critical>>
+        +bytes digest
+        +datetime time
+        +bytes tsa_signature
+    }
+    note for TimestampToken "{integrity = digest, time}\n{authenticity = tsa_signature}\n{freshness = time}"
+
+    class Verdict {
+        <<critical>>
+        +UUID report_id
+        +string outcome
+        +bytes arbiter_signature
+    }
+    note for Verdict "{integrity = report_id, outcome}\n{authenticity = arbiter_signature}\nSem identidade do autor"
+
+    class Arbiter {
+        +openVault(vault) string
+    }
+    note for Arbiter "rbac: so o papel Arbiter chama openVault\nAdversario default: Internet (le, apaga, insere)"
+
+    Credential *-- Vault
+    ReportEnvelope *-- Credential
+    ReportEnvelope *-- TimestampToken
+    ReportEnvelope ..> EpochKey : cifrado com
+    ReportEnvelope ..> EphemeralKey : assinado com
+    Arbiter ..> Vault : decifra
+    Arbiter ..> Verdict : emite

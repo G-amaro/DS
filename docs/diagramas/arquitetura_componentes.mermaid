@@ -1,0 +1,35 @@
+flowchart TB
+    subgraph MEMBROS["Membros da federação"]
+        M["Membro (cliente)<br/>sk_login, sk_ep, K_ep"]
+    end
+
+    TOR["Tor ou relay<br/>esconde o IP do membro"]
+
+    subgraph DIST["Distribuição (honest-but-curious)"]
+        G["Gateway anónimo<br/>valida credenciais, não guarda IPs"]
+        subgraph KAFKA["Apache Kafka"]
+            RPT["reports"]
+            CRB["corroborations"]
+            CTL["control"]
+        end
+    end
+
+    subgraph TRUST["Serviços de confiança"]
+        C["Coordinator<br/>inscrição, credenciais, revogação"]
+        A["Arbiter<br/>abre cofres em disputas"]
+        T["TSA<br/>timestamps"]
+        CA["CA privada (offline)"]
+    end
+
+    M -->|"publica e corrobora"| TOR --> G
+    G -->|"pede timestamp"| T
+    G -->|"relatórios"| RPT
+    G -->|"corroborações"| CRB
+    M -.->|"lê tudo (TLS direto)"| KAFKA
+    M -->|"login TLS e credencial"| C
+    M -->|"abre disputa"| A
+    C -->|"chaves de época"| CTL
+    A -->|"veredito sem identidade"| CTL
+    A -->|"identidade do autor"| C
+    CA -.->|"certificados"| C
+    CA -.->|"certificados TLS"| DIST

@@ -1,0 +1,83 @@
+erDiagram
+    MEMBER ||--o{ LOGIN_CERT : "tem"
+    MEMBER |o--o| REVOCATION : "pode ter"
+    MEMBER ||--o{ EPOCH_KEY_ENVELOPE : "recebe"
+    MEMBER ||..o{ VAULT : "so o Arbiter liga"
+    EPOCH ||--o{ EPOCH_KEY_ENVELOPE : "distribui"
+    EPOCH ||--o{ CREDENTIAL : "valida"
+    CREDENTIAL ||--|| VAULT : "contem"
+    CREDENTIAL ||--o{ REPORT : "assina"
+    CREDENTIAL ||--o{ CORROBORATION : "assina"
+    REPORT ||--o{ CORROBORATION : "recebe"
+    TIMESTAMP_TOKEN |o--|| REPORT : "carimba"
+    TIMESTAMP_TOKEN |o--|| CORROBORATION : "carimba"
+    REPORT ||--o{ DISPUTE : "alvo de"
+    DISPUTE ||--o| VERDICT : "resulta em"
+
+    MEMBER {
+        string member_id PK
+        string name
+        bytes login_pubkey
+        string status "active ou revoked"
+    }
+    LOGIN_CERT {
+        string serial PK
+        string member_id FK
+        datetime not_after
+    }
+    REVOCATION {
+        string member_id PK
+        datetime revoked_at
+        string reason
+    }
+    EPOCH {
+        int epoch_id PK
+        datetime starts_at
+        datetime ends_at
+    }
+    EPOCH_KEY_ENVELOPE {
+        int epoch_id FK
+        string member_id FK
+        bytes wrapped_key "K_ep cifrada para o membro, vai no topico control"
+    }
+    CREDENTIAL {
+        string credential_id PK
+        int epoch_id FK
+        bytes pk_ep "chave publica efemera"
+        bytes coordinator_signature
+    }
+    VAULT {
+        string vault_id PK
+        bytes ciphertext "id do membro, pk_ep e epoca, cifrado para o Arbiter"
+    }
+    REPORT {
+        uuid report_id PK
+        string credential_id FK
+        int epoch_id FK
+        bytes ciphertext "JSON cifrado com K_ep"
+        bytes signature "assinatura com sk_ep"
+    }
+    CORROBORATION {
+        string corroboration_id PK
+        uuid report_id FK
+        string credential_id FK
+        bytes ciphertext
+        bytes signature "unico por report_id e pk_ep"
+    }
+    TIMESTAMP_TOKEN {
+        string token_id PK
+        bytes digest
+        datetime time
+        bytes tsa_signature
+    }
+    DISPUTE {
+        string dispute_id PK
+        uuid report_id FK
+        datetime opened_at
+    }
+    VERDICT {
+        string verdict_id PK
+        string dispute_id FK
+        string outcome "retirado ou mantido"
+        bytes arbiter_signature
+    }

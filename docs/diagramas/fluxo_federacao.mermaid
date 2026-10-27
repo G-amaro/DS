@@ -1,0 +1,65 @@
+sequenceDiagram
+    autonumber
+    participant M as Membro
+    participant C as Coordinator
+    participant CA as CA privada (offline)
+    participant G as Gateway anónimo
+    participant T as TSA
+    participant K as Kafka
+    participant A as Arbiter
+
+    Note over M,A: 0. Preparação (uma vez)
+    CA-->>C: Emite certificados TLS (Coordinator, Gateway, TSA, Kafka, Arbiter)
+    M->>M: Gera o seu par de chaves de login (a privada nunca sai do membro)
+    C->>C: Inscreve o membro internamente (verificação fora de banda)
+    M->>C: Entrega a chave pública de login
+    C->>CA: Pede certificado de login para essa chave
+    CA-->>C: Certificado de login (a CA nunca emite credenciais de publicação)
+    C-->>M: Certificado de login + certificado raiz da CA
+
+    Note over M,K: 1. Início de cada época: credencial de pseudónimo e chave de grupo
+    M->>C: Login (TLS com certificado de login) + chave pública efémera pk_ep
+    C->>C: Verifica que o membro é válido e não está revogado
+    C->>C: Cria o cofre = Enc(chave pública do Arbiter, id do membro + pk_ep + época)
+    C-->>M: Credencial = Assina(pk_ep + época + cofre)
+    C->>K: Publica em control a chave K_ep cifrada para cada membro ativo
+    M->>K: Lê o tópico control (leitura direta, não revela o que o membro publica)
+    K-->>M: K_ep da época, cifrada só para este membro
+
+    Note over M,G: 2. Publicar um relatório (via Tor ou relay: o Gateway não vê o IP)
+    M->>M: Gera o JSON com report_id aleatório e cifra com K_ep
+    M->>M: Assina o envelope com sk_ep (inclui report_id e época)
+    M->>G: Envia envelope + assinatura + credencial
+    G->>G: Verifica credencial (assinada pelo Coordinator, época atual), assinatura e report_id não repetido
+    G->>T: Pede timestamp do hash do envelope
+    T-->>G: Token de timestamp assinado
+    G->>G: Aplica batching e atraso aleatório (não guarda IPs)
+    G->>K: Publica no tópico reports (sem dados de origem)
+    G-->>M: Confirmação pelo mesmo canal anónimo
+
+    Note over M,G: 3. Corroborar (outro membro, na mesma época do relatório)
+    M->>M: Verifica que pk_ep não é a do autor do relatório
+    M->>M: Cifra com K_ep e assina (report_id) com sk_ep
+    M->>G: Envia corroboração + assinatura + credencial (via Tor ou relay)
+    G->>G: Verifica credencial e rejeita pk_ep que já corroborou este report_id
+    G->>T: Pede timestamp da corroboração
+    T-->>G: Token de timestamp assinado
+    G->>K: Publica no tópico corroborations
+
+    Note over M,K: 4. Leitura e verificação (todos os membros ativos)
+    M->>K: Subscreve reports e corroborations (recupera o que perdeu offline)
+    K-->>M: Envelopes cifrados
+    M->>M: Decifra com K_ep e verifica credencial, assinatura, timestamp e repetições
+    M->>M: Conta corroborações distintas (pk_ep únicas e diferentes da do autor)
+
+    Note over M,A: 5. Disputa (a identidade fica só com o Arbiter e o Coordinator)
+    M->>A: Abre disputa (relatório, assinatura e credencial)
+    A->>A: Verifica a assinatura e decifra o cofre com a sua chave privada
+    A->>C: Entrega a identidade do autor para sanção ou revogação
+    A->>K: Publica em control o veredito (por exemplo, relatório retirado) sem identidade
+    K-->>M: Todos os membros leem o veredito, sem saber quem é o autor
+
+    Note over M,K: 6. Revogação
+    C->>C: Revoga o membro
+    C->>K: control: nova época e nova K_ep cifrada só para membros ativos
+    Note over C,K: A nova época invalida as credenciais antigas no Gateway. O revogado não obtém credencial nem chave novas

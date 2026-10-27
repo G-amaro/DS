@@ -1,0 +1,24 @@
+stateDiagram-v2
+    state "Membro" as MEMBRO {
+        [*] --> Inscrito : Coordinator inscreve
+        Inscrito --> Ativo : obtem credencial e K_ep
+        Ativo --> Ativo : nova epoca renova credencial e K_ep
+        Ativo --> Revogado : Coordinator revoga
+        Inscrito --> Revogado : Coordinator revoga
+        Revogado --> [*]
+    }
+
+    state "Relatorio" as RELATORIO {
+        [*] --> Criado : membro gera cifra e assina
+        Criado --> Rejeitado : credencial invalida ou repetido
+        Criado --> Publicado : Gateway carimba e publica
+        Publicado --> Corroborado : corroboracoes distintas na mesma epoca
+        Corroborado --> Corroborado : mais corroboracoes
+        Publicado --> EmDisputa : membro abre disputa
+        Corroborado --> EmDisputa : membro abre disputa
+        EmDisputa --> Retirado : veredito do Arbiter
+        EmDisputa --> Mantido : veredito do Arbiter
+        Rejeitado --> [*]
+        Retirado --> [*]
+        Mantido --> [*]
+    }

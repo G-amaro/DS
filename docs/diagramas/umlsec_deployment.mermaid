@@ -1,0 +1,21 @@
+flowchart TB
+    subgraph SYS["«secure links» Sistema da federação. Adversário na Internet: lê, apaga e insere mensagens"]
+        MC["«node» Cliente do membro<br/>sk_login, sk_ep, K_ep"]
+        GW["«node» Gateway anónimo"]
+        KB["«node» Kafka<br/>reports, corroborations, control"]
+        CO["«node» Coordinator"]
+        AR["«node» Arbiter"]
+        TS["«node» TSA"]
+    end
+
+    MC -->|"«Internet» «encrypted»<br/>Tor + TLS"| GW
+    MC -->|"«encrypted» TLS (leitura)"| KB
+    MC -->|"«encrypted» mTLS<br/>certificado de login"| CO
+    MC -->|"«encrypted» TLS<br/>disputa"| AR
+    GW -->|"«encrypted» TLS"| KB
+    GW -->|"«encrypted» TLS<br/>hash do envelope"| TS
+    CO -->|"«encrypted» TLS"| KB
+    AR -->|"«encrypted» mTLS"| CO
+    AR -->|"«encrypted» TLS"| KB
+
+    LEG["Dependências UMLsec<br/>«secrecy»: JSON do relatório, K_ep, sk_ep, cofre<br/>«integrity»: envelope, credencial, token, veredito<br/>«authenticity»: credencial assinada pelo Coordinator<br/>«freshness»: época, report_id, token da TSA<br/>Regra: toda a ligação com dependência tem de ser «encrypted»"]
