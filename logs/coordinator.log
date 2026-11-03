@@ -1,0 +1,50 @@
+[2026-10-29 11:21:01] [INFO] [coordinator] Servidor de atendimento a membros ativo em http://127.0.0.1:18443
+[2026-10-29 11:21:01] [INFO] [coordinator] Desafio PoP gerado com sucesso para membro 'ISP-Test-PT' na época 1 (ID: 842aa4b2-4326-44d7-9ac4-1fb1d46f3b4c)
+[2026-10-29 11:21:01] [INFO] [coordinator] [127.0.0.1:50342] "POST /api/v1/auth/challenge HTTP/1.1" 200 -
+[2026-10-29 11:21:01] [INFO] [coordinator] Credencial emitida com sucesso para membro 'ISP-Test-PT' (Época: 1, Credential ID: cb89ac7d-ca05-4cb0-9458-f45de8188481)
+[2026-10-29 11:21:01] [INFO] [coordinator] [127.0.0.1:50348] "POST /api/v1/credentials/issue HTTP/1.1" 201 -
+[2026-10-29 11:21:01] [WARNING] [coordinator] Membro 'ISP-Test-PT' já tem credencial emitida para a época 1. Pedido recusado.
+[2026-10-29 11:21:01] [INFO] [coordinator] [127.0.0.1:50358] "POST /api/v1/auth/challenge HTTP/1.1" 409 -
+[2026-10-29 11:21:01] [INFO] [coordinator] Chave da época 1 entregue encapsulada ao membro 'ISP-Test-PT'
+[2026-10-29 11:21:01] [INFO] [coordinator] [127.0.0.1:50372] "POST /api/v1/epoch/key HTTP/1.1" 200 -
+[2026-10-29 11:21:01] [WARNING] [coordinator] Membro revogado 'ISP-Test-PT' tentou obter desafio PoP de ('127.0.0.1', 50382)
+[2026-10-29 11:21:01] [INFO] [coordinator] [127.0.0.1:50382] "POST /api/v1/auth/challenge HTTP/1.1" 403 -
+[2026-10-29 11:21:01] [INFO] [coordinator] A encerrar servidor de atendimento a membros...
+[2026-10-29 11:21:01] [INFO] [coordinator] Servidor de atendimento a membros encerrado.
+[2026-10-29 11:21:35] [INFO] [coordinator] Servidor de atendimento a membros ativo em http://127.0.0.1:42987
+[2026-10-29 11:21:35] [INFO] [coordinator] Desafio PoP gerado com sucesso para membro 'ISP-Test-PT' na época 1 (ID: 70e347bb-1bb7-4d21-9ad5-64a170c1e5ce)
+[2026-10-29 11:21:35] [INFO] [coordinator] [127.0.0.1:49514] "POST /api/v1/auth/challenge HTTP/1.1" 200 -
+[2026-10-29 11:21:35] [INFO] [coordinator] Credencial emitida com sucesso para membro 'ISP-Test-PT' (Época: 1, Credential ID: 5ce59017-9850-4cab-8ea8-c1bb166d730f)
+[2026-10-29 11:21:35] [INFO] [coordinator] [127.0.0.1:49522] "POST /api/v1/credentials/issue HTTP/1.1" 201 -
+[2026-10-29 11:21:35] [WARNING] [coordinator] Membro 'ISP-Test-PT' já tem credencial emitida para a época 1. Pedido recusado.
+[2026-10-29 11:21:35] [INFO] [coordinator] [127.0.0.1:49538] "POST /api/v1/auth/challenge HTTP/1.1" 409 -
+[2026-10-29 11:21:35] [INFO] [coordinator] Chave da época 1 entregue encapsulada ao membro 'ISP-Test-PT'
+[2026-10-29 11:21:35] [INFO] [coordinator] [127.0.0.1:49544] "POST /api/v1/epoch/key HTTP/1.1" 200 -
+[2026-10-29 11:21:35] [WARNING] [coordinator] Membro revogado 'ISP-Test-PT' tentou obter desafio PoP de ('127.0.0.1', 49552)
+[2026-10-29 11:21:35] [INFO] [coordinator] [127.0.0.1:49552] "POST /api/v1/auth/challenge HTTP/1.1" 403 -
+[2026-10-29 11:21:35] [INFO] [coordinator] A encerrar servidor de atendimento a membros...
+[2026-10-29 11:21:35] [INFO] [coordinator] Servidor de atendimento a membros encerrado.
+[2026-10-29 11:21:35] [INFO] [coordinator] Servidor de atendimento a membros ativo em http://127.0.0.1:39445
+[2026-10-29 11:21:35] [INFO] [coordinator] [127.0.0.1:54914] "GET /health HTTP/1.1" 200 -
+[2026-10-29 11:21:35] [INFO] [coordinator] A encerrar servidor de atendimento a membros...
+[2026-10-29 11:21:36] [INFO] [coordinator] Servidor de atendimento a membros encerrado.
+[2026-10-29 11:21:44] [INFO] [coordinator] === A iniciar o Federation Coordinator ===
+[2026-10-29 11:21:44] [INFO] [coordinator] Novo par de chaves Ed25519 gerado para o Coordinator em /home/goncalo/Documents/SD/Projeto/data/coordinator_keys
+[2026-10-29 11:21:44] [INFO] [coordinator] Chave pública do Arbiter configurada em /home/goncalo/Documents/SD/Projeto/data/coordinator_keys/arbiter_pk.pem
+[2026-10-29 11:21:44] [INFO] [coordinator] Época inicial 1 criada automaticamente com chave K_ep.
+[2026-10-29 11:21:52] [INFO] [coordinator] === A iniciar o Federation Coordinator ===
+[2026-10-29 11:21:52] [INFO] [coordinator] Membro 'ISP-Alpha' (Operador de Lisboa) inscrito com sucesso. Credenciais geradas em /home/goncalo/Documents/SD/Projeto/data/members/ISP-Alpha_credentials.json
+[2026-10-29 11:27:40] [INFO] [coordinator] === A iniciar o Federation Coordinator ===
+[2026-10-29 11:27:40] [INFO] [coordinator] Servidor de atendimento a membros ativo em http://127.0.0.1:8443
+[2026-10-29 11:28:35] [INFO] [coordinator] [127.0.0.1:38644] "GET / HTTP/1.1" 404 -
+[2026-10-29 11:28:35] [INFO] [coordinator] [127.0.0.1:38660] "GET /favicon.ico HTTP/1.1" 404 -
+[2026-10-29 11:29:03] [INFO] [coordinator] Membro 'Pais' (oa) inscrito com sucesso. Credenciais geradas em /home/goncalo/Documents/SD/Projeto/data/members/Pais_credentials.json
+[2026-10-29 11:30:28] [WARNING] [coordinator] Membro 'Pais' foi REVOGADO pelo operador. Motivo: otario
+[2026-10-29 11:30:28] [INFO] [coordinator] Nova época 2 iniciada após revogação de 'Pais'.
+[2026-10-29 11:31:14] [INFO] [coordinator] A encerrar servidor de atendimento a membros...
+[2026-10-29 11:31:14] [INFO] [coordinator] Servidor de atendimento a membros encerrado.
+[2026-10-29 11:32:57] [INFO] [coordinator] === A iniciar o Federation Coordinator ===
+[2026-10-29 11:32:57] [INFO] [coordinator] Servidor de atendimento a membros ativo em http://127.0.0.1:8443
+[2026-10-29 11:33:12] [INFO] [coordinator] Operador avançou para a Época 3.
+[2026-10-29 11:33:43] [INFO] [coordinator] A encerrar servidor de atendimento a membros...
+[2026-10-29 11:33:43] [INFO] [coordinator] Servidor de atendimento a membros encerrado.
