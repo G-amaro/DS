@@ -1,0 +1,132 @@
+sequenceDiagram
+    autonumber
+    participant M as Membro
+    participant C as Coordinator
+    participant CA as CA privada (offline)
+    participant G as Gateway anónimo
+    participant T as TSA
+    participant K as Kafka
+    participant A as Arbiter
+
+    Note over M,A: Convenções: época E = 12 h (00:00 e 12:00 UTC). Versão V = diretório de membros + K_adm, muda a cada época e a cada revogação
+
+    Note over M,A: 0. Preparação (uma vez)
+    CA-->>C: Emite certificados TLS (Coordinator, Gateway, TSA, Kafka, Arbiter)
+    C->>C: Gera código de inscrição de uso único para o operador
+    C-->>M: Código + certificado raiz da CA + impressão digital + chaves públicas do Coordinator e do Arbiter (fora de banda)
+
+    Note over M,A: 1. Inscrição do membro
+    M->>M: Gera sk_login (Ed25519), sk_enc (X25519) e a semente dos pseudónimos
+    M->>M: Cria o CSR com a chave pública de login
+    M->>C: Código + CSR + chave pública de cifra assinada com sk_login (TLS de servidor)
+    C->>C: Valida o código (uso único, validade curta) e as provas de posse
+    C->>CA: Pede a assinatura do CSR
+    CA-->>C: Certificado de login (a CA nunca emite nada usado para publicar)
+    C->>C: Regista membro, chaves públicas e serial do certificado (invalida o código)
+    C-->>M: Certificado de login
+
+    Note over M,K: 2. Pedido de lote: credenciais das próximas épocas (até 6 épocas, ou seja 3 dias)
+    M->>M: Deriva a cadeia: sk_E = HKDF(CK_E, key) e CK_E+1 = HKDF(CK_E, next), apagando os segredos já usados
+    M->>C: Pedido de lote (mTLS) com pk_E de cada época
+    C->>C: Verifica que o certificado não está na CRL, o horizonte e que não há credencial emitida para (membro, E)
+    C-->>M: Desafio aleatório (um só para o lote)
+    M->>C: Prova de posse = Assina(sk_E, E + desafio) para cada época
+    C->>C: Cria o cofre em duas camadas: interior ECIES(chave do Arbiter, member_id + pk_E + E) e exterior ECIES(chave de cofre do Coordinator, interior)
+    C->>C: Assina a credencial (hash do cofre) e regista só (membro, E) como emitido, nunca a pk_E
+    C-->>M: Lote de credenciais com cofres
+
+    Note over M,K: 3. Versão V: diretório de membros e K_adm (a cada época e a cada revogação)
+    C->>C: Gera K_adm aleatória (não decifra nada) e o diretório com as chaves públicas de cifra dos membros ativos
+    C->>K: control: diretório V assinado + K_adm cifrada (ECIES) para cada membro ativo
+    C->>G: Entrega a K_adm da versão V (TLS, assinado)
+    M->>K: Lê control (mTLS)
+    M->>M: Verifica a assinatura do diretório e guarda K_adm
+
+    loop Renovação escalonada, quando restam cerca de 2 épocas (24 h) de credenciais
+        M->>M: Espera um atraso aleatório (jitter) para não coincidir com outros membros
+        M->>C: Novo pedido de lote para as épocas seguintes (como em 2)
+        C-->>M: Credenciais das novas épocas
+    end
+
+    Note over M,G: 4. Publicar um relatório (via Tor, sem certificado de login)
+    M->>M: Gera o JSON com report_id aleatório e a chave de conteúdo K_c aleatória
+    M->>M: Cifra o JSON com K_c (AES-GCM, dados associados = época + rid + versão V)
+    M->>M: Cifra K_c (ECIES) para cada membro do diretório V e junta a lista ao envelope
+    M->>M: Calcula rid = SHA-256(report_id) e assina com sk_E o hash do ciphertext e da lista de chaves
+    M->>M: Calcula o HMAC de admissão com K_adm
+    M->>G: Envelope (ciphertext + lista de chaves cifradas) + E + V + rid + assinatura + HMAC + credencial
+    G->>G: Verifica o HMAC com a K_adm de V, que V é a atual, a credencial (assinatura do Coordinator, época atual), a assinatura, rid novo e quota por pk_E
+    G->>G: Aceita a versão anterior só uns minutos após a fronteira de época, e nunca após uma revogação
+    G->>G: Guarda rid → pk_E e época
+    G->>T: Pede timestamp do hash do envelope
+    T-->>G: Token de timestamp assinado
+    G->>G: Aplica batching e atraso aleatório (não guarda IPs)
+    G->>K: Publica no tópico reports
+    G-->>M: Confirmação pelo mesmo canal anónimo
+
+    Note over M,G: 5. Corroborar (outro membro, na mesma época do relatório, janela de 12 h)
+    M->>M: Cifra a corroboração com uma K_c nova, cifra K_c para o diretório V e assina com sk_E
+    M->>M: Calcula o HMAC de admissão com K_adm
+    M->>G: Corroboração + lista de chaves + E + V + rid + assinatura + HMAC + credencial (via Tor)
+    G->>G: Verifica HMAC, versão, credencial, assinatura e quota
+    G->>G: Rejeita se a época for diferente da do relatório
+    G->>G: Rejeita se pk_E = pk_E do autor do rid (auto-corroboração)
+    G->>G: Rejeita se pk_E já corroborou este rid (dupla corroboração)
+    G->>T: Pede timestamp da corroboração
+    T-->>G: Token de timestamp assinado
+    G->>K: Publica no tópico corroborations
+
+    Note over M,K: 6. Leitura e verificação (todos os membros ativos)
+    M->>K: Subscreve reports, corroborations e control (mTLS, recupera o que perdeu offline)
+    K-->>M: Mensagens cifradas
+    M->>M: Encontra a sua entrada na lista de chaves e decifra K_c com sk_enc
+    M->>M: Decifra o conteúdo com K_c e valida JSON, credencial, assinatura, token e época
+    M->>M: Repete as regras do Gateway (pk_E ≠ autor, sem pk_E repetidas, mesma época)
+    M->>M: Atualiza o índice local e conta pk_E distintas por rid
+
+    Note over M,A: 7. Disputa (o Arbiter avalia antes de abrir qualquer cofre)
+    M->>A: Abre disputa sobre um rid, com K_c do relatório e as provas (mTLS)
+    A->>A: Verifica que o certificado do requerente não está na CRL e aplica o limite de disputas por membro
+    A->>K: Obtém o envelope original pelo rid (não confia no requerente)
+    K-->>A: Envelope com credencial e cofre
+    A->>A: Verifica a credencial e a assinatura, e confirma que K_c decifra o relatório
+    A->>A: Avalia as provas e decide se a disputa é procedente, sem abrir o cofre
+    alt Disputa procedente
+        A->>C: Pede a remoção da camada exterior do cofre (rid, parecer e provas)
+        C->>C: Valida o pedido (controlo duplo) e remove a camada exterior com a sua chave de cofre
+        C-->>A: Cofre interior (ainda cifrado para o Arbiter)
+        A->>A: Decifra o cofre interior e confirma que member_id, pk_E e época coincidem com a credencial
+        A->>C: Entrega o member_id do autor (só ao Coordinator)
+        C->>C: Avalia a sanção com o Arbiter
+        alt Agente malicioso confirmado
+            C->>C: Decide revogar o membro (ver 8)
+        else Sem má-fé
+            C->>C: Mantém o membro ativo
+        end
+    else Disputa improcedente
+        A->>A: Arquiva sem abrir o cofre
+    end
+    A->>K: control: veredito assinado sobre o relatório, sem identidade
+    K-->>M: Todos leem o veredito, sem saber quem é o autor
+
+    Note over C,K: 8. Revogação (blacklist de certificados e nova versão V)
+    alt Disputa com agente malicioso confirmado
+        C->>C: Inicia a revogação a partir da disputa
+    else Saída da federação ou chave comprometida
+        C->>C: Recebe o pedido fora de banda e confirma com o operador
+    end
+    C->>C: Marca o membro como revogado e acrescenta o serial do certificado à blacklist
+    C->>CA: Pede nova CRL com o serial revogado
+    CA-->>C: CRL assinada pela CA (cRLNumber crescente e nextUpdate)
+    C->>A: Envia a CRL (não é publicada aos membros)
+    C->>K: Instala a CRL no broker (não é publicada aos membros)
+    C->>C: Passa a recusar pedidos de lote e login ao certificado revogado
+    C->>C: Gera a versão V+1: retira o membro do diretório e gera nova K_adm
+    C->>K: control: diretório V+1 assinado + K_adm cifrada (ECIES) para cada membro ativo
+    C->>G: Entrega a K_adm da versão V+1 (assinado)
+    M->>K: Membros ativos leem control, sem ligar ao Coordinator
+    G->>G: Passa a exigir a versão V+1 (a anterior deixa de valer, sem margem)
+    Note over C,K: O revogado não consta do diretório V+1, por isso não recebe K_c das mensagens novas e o Gateway recusa os seus envelopes por falta da K_adm
+    Note over C,K: O Coordinator nunca tem chaves de conteúdo. O Arbiter não abre cofres sozinho
+    Note over C,K: Os servidores verificam a assinatura da CA, o cRLNumber e o nextUpdate. CRL expirada ou mais antiga é recusada
+    Note over C,K: A blacklist só abrange membros. As corroborações são controladas por pk_E, época e rid

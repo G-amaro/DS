@@ -1,0 +1,46 @@
+flowchart TB
+    subgraph LOCAL["Cliente do membro (local)"]
+        SEED["Semente<br/>CSPRNG, cifrada em disco"]
+        CKE["Cadeia CK_E"]
+        CKN["Cadeia CK_E+1"]
+        SKE["sk_E e pk_E<br/>par Ed25519 da época E (12 h)"]
+        CRED["Credencial da época E<br/>com cofre em duas camadas"]
+        SKENC["sk_enc (X25519)<br/>decifra as chaves de conteúdo"]
+        KC["K_c<br/>chave aleatória por mensagem"]
+        KADM["K_adm da versão V<br/>HMAC de admissão"]
+    end
+
+    subgraph COORD["Coordinator"]
+        C["Emissão em lote (até 6 épocas)<br/>e gestão de versões"]
+        DIR["Diretório V<br/>chaves públicas de cifra dos membros ativos, assinado"]
+        KADMC["K_adm V<br/>aleatória, não decifra nada"]
+        VAULTC["Chave de cofre do Coordinator<br/>camada exterior"]
+    end
+
+    subgraph SERV["Servidores"]
+        G["Gateway<br/>guarda só K_adm, não decifra"]
+        A["Arbiter<br/>chave de cofre, camada interior, e CRL"]
+        K["Kafka<br/>guarda a CRL, tópico control"]
+    end
+
+    CA["CA privada (offline)<br/>assina a CRL"]
+
+    SEED --> CKE
+    CKE -->|"HKDF key"| SKE
+    CKE -->|"HKDF next, apaga CK_E"| CKN
+    SKE -->|"pk_E de cada época do lote (mTLS)"| C
+    C -->|"credencial assinada e cofre em duas camadas"| CRED
+    C --> DIR
+    C --> KADMC
+    C --> VAULTC
+    DIR -->|"lista de destinatários, via control"| KC
+    KC -->|"ECIES para cada membro do diretório, no envelope"| SKENC
+    KADMC -->|"ECIES para cada membro ativo, via control"| KADM
+    KADMC -->|"só esta chave"| G
+    KADM -->|"HMAC em cada envelope"| G
+    A -->|"disputa procedente: pede remoção da camada exterior"| C
+    C -->|"cofre interior, ainda cifrado para o Arbiter"| A
+    C -->|"pede CRL com o serial revogado"| CA
+    CA -->|"CRL assinada"| C
+    C -->|"CRL"| A
+    C -->|"CRL"| K
