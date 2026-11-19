@@ -14,13 +14,13 @@ flowchart TB
         C["Emissão em lote (até 6 épocas)<br/>e gestão de versões"]
         DIR["Diretório V<br/>chaves públicas de cifra dos membros ativos, assinado"]
         KADMC["K_adm V<br/>aleatória, não decifra nada"]
-        VAULTC["Chave de cofre do Coordinator<br/>camada exterior"]
+        VAULTC["Chave de cofre do Coordinator<br/>camada exterior, rodada todos os meses"]
     end
 
     subgraph SERV["Servidores"]
         G["Gateway<br/>guarda só K_adm, não decifra"]
-        A["Arbiter<br/>chave de cofre, camada interior, e CRL"]
-        K["Kafka<br/>guarda a CRL, tópico control"]
+        A["Arbiter<br/>chave de cofre mensal, camada interior, e CRL"]
+        K["Kafka<br/>retenção de 31 dias, guarda a CRL, tópico control"]
     end
 
     CA["CA privada (offline)<br/>assina a CRL"]

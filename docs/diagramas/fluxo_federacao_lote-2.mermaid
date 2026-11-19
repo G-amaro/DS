@@ -8,7 +8,7 @@ sequenceDiagram
     participant K as Kafka
     participant A as Arbiter
 
-    Note over M,A: Convenções: época E = 12 h (00:00 e 12:00 UTC). Versão V = diretório de membros + K_adm, muda a cada época e a cada revogação
+    Note over M,A: Convenções: época E = 12 h (00:00 e 12:00 UTC). Versão V = diretório de membros + K_adm, muda a cada época e a cada revogação. Prazo de disputas = 30 dias, retenção do Kafka = 31 dias
 
     Note over M,A: 0. Preparação (uma vez)
     CA-->>C: Emite certificados TLS (Coordinator, Gateway, TSA, Kafka, Arbiter)
@@ -31,7 +31,7 @@ sequenceDiagram
     C->>C: Verifica que o certificado não está na CRL, o horizonte e que não há credencial emitida para (membro, E)
     C-->>M: Desafio aleatório (um só para o lote)
     M->>C: Prova de posse = Assina(sk_E, E + desafio) para cada época
-    C->>C: Cria o cofre em duas camadas: interior ECIES(chave do Arbiter, member_id + pk_E + E) e exterior ECIES(chave de cofre do Coordinator, interior)
+    C->>C: Cria o cofre em duas camadas com as chaves de cofre do mês: interior ECIES(chave do Arbiter, member_id + pk_E + E) e exterior ECIES(chave do Coordinator, interior), com o identificador da geração das chaves
     C->>C: Assina a credencial (hash do cofre) e regista só (membro, E) como emitido, nunca a pk_E
     C-->>M: Lote de credenciais com cofres
 
@@ -84,11 +84,12 @@ sequenceDiagram
     M->>M: Repete as regras do Gateway (pk_E ≠ autor, sem pk_E repetidas, mesma época)
     M->>M: Atualiza o índice local e conta pk_E distintas por rid
 
-    Note over M,A: 7. Disputa (o Arbiter avalia antes de abrir qualquer cofre)
+    Note over M,A: 7. Disputa (prazo de 30 dias, o Arbiter avalia antes de abrir qualquer cofre)
     M->>A: Abre disputa sobre um rid, com K_c do relatório e as provas (mTLS)
     A->>A: Verifica que o certificado do requerente não está na CRL e aplica o limite de disputas por membro
     A->>K: Obtém o envelope original pelo rid (não confia no requerente)
     K-->>A: Envelope com credencial e cofre
+    A->>A: Verifica pelo token da TSA que o relatório tem menos de 30 dias e guarda uma cópia do envelope (o caso fica congelado)
     A->>A: Verifica a credencial e a assinatura, e confirma que K_c decifra o relatório
     A->>A: Avalia as provas e decide se a disputa é procedente, sem abrir o cofre
     alt Disputa procedente
@@ -130,3 +131,15 @@ sequenceDiagram
     Note over C,K: O Coordinator nunca tem chaves de conteúdo. O Arbiter não abre cofres sozinho
     Note over C,K: Os servidores verificam a assinatura da CA, o cRLNumber e o nextUpdate. CRL expirada ou mais antiga é recusada
     Note over C,K: A blacklist só abrange membros. As corroborações são controladas por pk_E, época e rid
+
+    Note over K,A: 9. Retenção, prazo de disputas e rotação das chaves de cofre (30 dias)
+    K->>K: Retém reports, corroborations e control durante 31 dias e apaga o resto
+    Note over M,K: Um membro offline há mais de 31 dias perde o histórico mais antigo. Disputas sobre relatórios com mais de 30 dias são recusadas
+    loop Todos os meses
+        A->>A: Gera um novo par de chaves de cofre e assina a chave pública com a chave de assinatura do Arbiter
+        A->>C: Entrega a nova chave pública de cofre (assinada)
+        C->>C: Verifica a assinatura, gera o seu novo par de chaves de cofre e passa a usar as chaves novas nas credenciais seguintes
+        A->>A: Destrói a chave privada antiga 30 dias depois da última época que ela cobre
+        C->>C: Destrói a sua chave de cofre antiga no mesmo prazo
+    end
+    Note over A,C: A chave antiga fica retida enquanto houver casos abertos que dependam dela. Depois de destruída, os cofres dessa geração já não se abrem
