@@ -1,0 +1,9 @@
+ao enviar um report para o gateway, enviar a assinatura pode quebrar a unlinkability
+o primeiro node do Tor é public, deal with it
+Pseudonimos(inspiração na bitcoin wallet)unlinkability
+a verificação da pk na corroboração não está correta
+depois de ver um relatorio, como ver update nas correbaraçoes automaticamente
+id do relatório é publico ou nao (???)
+criar blacklist de menbros no coordenador (nova epoca a cada revogação continua)
+    certificados de menbro não dependentes da epoca para nao dar overload.
+tsa diferente endidade da CA???

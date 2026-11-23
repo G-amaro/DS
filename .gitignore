@@ -1,0 +1,14 @@
+# Ambiente virtual e Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDEs e Sistema Operativo
+.idea/
+.vscode/
+.DS_Store
+
+# Dados e logs locais
+logs/
+*.log

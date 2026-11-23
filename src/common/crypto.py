@@ -28,6 +28,12 @@ DOMAIN_POP = b"FED-POP-v1"
 DOMAIN_REPORT = b"FED-REPORT-v1"
 DOMAIN_CORROB = b"FED-CORROB-v1"
 DOMAIN_VERDICT = b"FED-VERDICT-v1"
+DOMAIN_DIRECTORY = b"FED-DIR-v1"
+DOMAIN_ADMISSION = b"FED-ADM-v1"
+
+# Rótulos HKDF (separação de utilização) para a cadeia de pseudónimos
+INFO_CHAIN_KEY = b"FED-CHAIN-key-v1"
+INFO_CHAIN_NEXT = b"FED-CHAIN-next-v1"
 
 
 def _pack_with_length(data: bytes) -> bytes:
@@ -196,8 +202,26 @@ def aes_gcm_decrypt(key: bytes, payload: bytes, associated_data: bytes | None = 
 
 # --- Cifra Híbrida / ECIES (X25519 + HKDF-SHA256 + AES-256-GCM) ---
 
-def ecies_encrypt(recipient_public_key: x25519.X25519PublicKey, plaintext: bytes, info: bytes = b"FED-ECIES-v1") -> bytes:
+def _ecies_key(shared_secret: bytes, eph_pub_bytes: bytes, recipient_pub_bytes: bytes, info: bytes) -> bytes:
+    """Deriva a chave AES do ECIES. O salt liga a chave às duas chaves públicas envolvidas."""
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=eph_pub_bytes + recipient_pub_bytes,
+        info=info,
+    ).derive(shared_secret)
+
+
+def ecies_encrypt(
+    recipient_public_key: x25519.X25519PublicKey,
+    plaintext: bytes,
+    info: bytes = b"FED-ECIES-v1",
+    associated_data: bytes | None = None,
+) -> bytes:
     """Cifra para uma chave pública X25519 destinatária usando ECIES efémero.
+
+    `info` separa utilizações (HKDF) e `associated_data` é autenticado pelo AES-GCM,
+    de modo que um criptograma não possa ser reutilizado noutro contexto.
 
     Formato resultante:
     ephemeral_public_key (32 bytes) + nonce (12 bytes) + ciphertext_and_tag.
@@ -205,23 +229,23 @@ def ecies_encrypt(recipient_public_key: x25519.X25519PublicKey, plaintext: bytes
     ephemeral_private, ephemeral_public = generate_x25519_keypair()
     shared_secret = ephemeral_private.exchange(recipient_public_key)
 
-    # Derivar chave simétrica de 32 bytes via HKDF-SHA256
-    derived_aes_key = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=info,
-    ).derive(shared_secret)
+    eph_pub_bytes = x25519_public_to_raw(ephemeral_public)
+    recipient_pub_bytes = x25519_public_to_raw(recipient_public_key)
+    derived_aes_key = _ecies_key(shared_secret, eph_pub_bytes, recipient_pub_bytes, info)
 
     nonce = os.urandom(12)
     aesgcm = AESGCM(derived_aes_key)
-    ciphertext_and_tag = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+    ciphertext_and_tag = aesgcm.encrypt(nonce, plaintext, associated_data)
 
-    eph_pub_bytes = x25519_public_to_raw(ephemeral_public)
     return eph_pub_bytes + nonce + ciphertext_and_tag
 
 
-def ecies_decrypt(recipient_private_key: x25519.X25519PrivateKey, payload: bytes, info: bytes = b"FED-ECIES-v1") -> bytes:
+def ecies_decrypt(
+    recipient_private_key: x25519.X25519PrivateKey,
+    payload: bytes,
+    info: bytes = b"FED-ECIES-v1",
+    associated_data: bytes | None = None,
+) -> bytes:
     """Decifra payload ECIES usando a chave privada X25519 do destinatário."""
     if len(payload) < 32 + 12 + 16:
         raise ValueError("Payload ECIES demasiado curto.")
@@ -233,18 +257,14 @@ def ecies_decrypt(recipient_private_key: x25519.X25519PrivateKey, payload: bytes
     ephemeral_public = x25519_public_from_raw(eph_pub_bytes)
     shared_secret = recipient_private_key.exchange(ephemeral_public)
 
-    derived_aes_key = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=info,
-    ).derive(shared_secret)
+    recipient_pub_bytes = x25519_public_to_raw(recipient_private_key.public_key())
+    derived_aes_key = _ecies_key(shared_secret, eph_pub_bytes, recipient_pub_bytes, info)
 
     aesgcm = AESGCM(derived_aes_key)
     try:
-        return aesgcm.decrypt(nonce, ciphertext_and_tag, associated_data=None)
+        return aesgcm.decrypt(nonce, ciphertext_and_tag, associated_data)
     except InvalidTag:
-        raise ValueError("Falha na decifração ECIES (dados corrompidos ou chave incorreta).")
+        raise ValueError("Falha na decifração ECIES (dados corrompidos, chave, info ou contexto incorretos).")
 
 
 # --- Prova de Posse (Proof-of-Possession) do Membro ---
@@ -331,3 +351,218 @@ def parse_vault_payload(plaintext: bytes) -> Tuple[str, bytes, int]:
     epoch_bytes = unpack_next()
     epoch_id = struct.unpack(">I", epoch_bytes)[0]
     return member_id, pk_ep_bytes, epoch_id
+
+
+# --- Identificadores e lista de destinatários ---
+
+def compute_rid(report_id: str) -> bytes:
+    """rid = SHA-256(report_id). Público; o report_id fica só dentro do conteúdo cifrado."""
+    return hashlib.sha256(report_id.encode("utf-8")).digest()
+
+
+def recipient_key_id(recipient_pub_raw: bytes) -> bytes:
+    """Identificador de um destinatário na lista de chaves: SHA-256 da chave pública de cifra."""
+    return hashlib.sha256(recipient_pub_raw).digest()
+
+
+def serialize_key_list(entries: list[tuple[bytes, bytes]]) -> bytes:
+    """Serializa a lista de chaves [(key_id, K_c cifrada)] de forma determinística (ordem dada)."""
+    out = struct.pack(">I", len(entries))
+    for key_id, wrapped in entries:
+        out += _pack_with_length(key_id) + _pack_with_length(wrapped)
+    return out
+
+
+def parse_key_list(data: bytes) -> list[tuple[bytes, bytes]]:
+    """Inverso de serialize_key_list. Rejeita dados truncados ou com lixo no fim."""
+    if len(data) < 4:
+        raise ValueError("Lista de chaves incompleta.")
+    (count,) = struct.unpack(">I", data[:4])
+    offset = 4
+
+    def take() -> bytes:
+        nonlocal offset
+        if offset + 4 > len(data):
+            raise ValueError("Lista de chaves truncada.")
+        (length,) = struct.unpack(">I", data[offset:offset + 4])
+        offset += 4
+        if offset + length > len(data):
+            raise ValueError("Lista de chaves truncada.")
+        chunk = data[offset:offset + length]
+        offset += length
+        return chunk
+
+    entries = []
+    for _ in range(count):
+        key_id = take()
+        wrapped = take()
+        entries.append((key_id, wrapped))
+    if offset != len(data):
+        raise ValueError("Lista de chaves com dados a mais.")
+    return entries
+
+
+def envelope_digest(ciphertext: bytes, key_list: bytes) -> bytes:
+    """SHA-256 do ciphertext e da lista de chaves (com prefixos de comprimento)."""
+    return hashlib.sha256(_pack_with_length(ciphertext) + _pack_with_length(key_list)).digest()
+
+
+# --- Assinatura de relatórios e corroborações (sk_E) ---
+
+def _envelope_message(domain: bytes, epoch_id: int, version: int, rid: bytes,
+                      ciphertext: bytes, key_list: bytes) -> bytes:
+    return (
+        domain
+        + _pack_with_length(struct.pack(">I", epoch_id))
+        + _pack_with_length(struct.pack(">I", version))
+        + _pack_with_length(rid)
+        + _pack_with_length(envelope_digest(ciphertext, key_list))
+    )
+
+
+def _sign_envelope(domain: bytes, sk_ep: ed25519.Ed25519PrivateKey, epoch_id: int, version: int,
+                   rid: bytes, ciphertext: bytes, key_list: bytes) -> bytes:
+    return sk_ep.sign(_envelope_message(domain, epoch_id, version, rid, ciphertext, key_list))
+
+
+def _verify_envelope(domain: bytes, pk_ep: ed25519.Ed25519PublicKey, epoch_id: int, version: int,
+                     rid: bytes, ciphertext: bytes, key_list: bytes, signature: bytes) -> bool:
+    try:
+        pk_ep.verify(signature, _envelope_message(domain, epoch_id, version, rid, ciphertext, key_list))
+        return True
+    except InvalidSignature:
+        return False
+
+
+def sign_report(sk_ep, epoch_id: int, version: int, rid: bytes, ciphertext: bytes, key_list: bytes) -> bytes:
+    """Assina um relatório com sk_E (domínio FED-REPORT-v1)."""
+    return _sign_envelope(DOMAIN_REPORT, sk_ep, epoch_id, version, rid, ciphertext, key_list)
+
+
+def verify_report(pk_ep, epoch_id: int, version: int, rid: bytes, ciphertext: bytes,
+                  key_list: bytes, signature: bytes) -> bool:
+    """Verifica a assinatura de um relatório."""
+    return _verify_envelope(DOMAIN_REPORT, pk_ep, epoch_id, version, rid, ciphertext, key_list, signature)
+
+
+def sign_corroboration(sk_ep, epoch_id: int, version: int, rid: bytes, ciphertext: bytes, key_list: bytes) -> bytes:
+    """Assina uma corroboração com sk_E (domínio FED-CORROB-v1)."""
+    return _sign_envelope(DOMAIN_CORROB, sk_ep, epoch_id, version, rid, ciphertext, key_list)
+
+
+def verify_corroboration(pk_ep, epoch_id: int, version: int, rid: bytes, ciphertext: bytes,
+                         key_list: bytes, signature: bytes) -> bool:
+    """Verifica a assinatura de uma corroboração."""
+    return _verify_envelope(DOMAIN_CORROB, pk_ep, epoch_id, version, rid, ciphertext, key_list, signature)
+
+
+def report_aad(epoch_id: int, rid: bytes, version: int) -> bytes:
+    """Dados associados do AES-GCM do conteúdo: época, rid e versão V."""
+    return (
+        _pack_with_length(struct.pack(">I", epoch_id))
+        + _pack_with_length(rid)
+        + _pack_with_length(struct.pack(">I", version))
+    )
+
+
+# --- Diretório de membros (Coordinator) ---
+
+def create_directory_message(version: int, member_pubkeys: list[bytes]) -> bytes:
+    """Mensagem do diretório V: versão e lista das chaves públicas de cifra dos membros ativos."""
+    msg = DOMAIN_DIRECTORY + _pack_with_length(struct.pack(">I", version))
+    msg += struct.pack(">I", len(member_pubkeys))
+    for pub in member_pubkeys:
+        msg += _pack_with_length(pub)
+    return msg
+
+
+def sign_directory(coordinator_sk: ed25519.Ed25519PrivateKey, version: int, member_pubkeys: list[bytes]) -> bytes:
+    """O Coordinator assina o diretório da versão V."""
+    return coordinator_sk.sign(create_directory_message(version, member_pubkeys))
+
+
+def verify_directory(coordinator_pk: ed25519.Ed25519PublicKey, version: int,
+                     member_pubkeys: list[bytes], signature: bytes) -> bool:
+    """Verifica a assinatura do diretório da versão V."""
+    try:
+        coordinator_pk.verify(signature, create_directory_message(version, member_pubkeys))
+        return True
+    except InvalidSignature:
+        return False
+
+
+# --- Veredito (Arbiter) ---
+
+def create_verdict_message(rid: bytes, result: str) -> bytes:
+    return DOMAIN_VERDICT + _pack_with_length(rid) + _pack_with_length(result.encode("utf-8"))
+
+
+def sign_verdict(arbiter_sk: ed25519.Ed25519PrivateKey, rid: bytes, result: str) -> bytes:
+    """O Arbiter assina o veredito sobre um rid (sem identidade)."""
+    return arbiter_sk.sign(create_verdict_message(rid, result))
+
+
+def verify_verdict(arbiter_pk: ed25519.Ed25519PublicKey, rid: bytes, result: str, signature: bytes) -> bool:
+    """Verifica a assinatura do veredito."""
+    try:
+        arbiter_pk.verify(signature, create_verdict_message(rid, result))
+        return True
+    except InvalidSignature:
+        return False
+
+
+# --- Cadeia de pseudónimos por época ---
+
+def _hkdf32(ikm: bytes, info: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(ikm)
+
+
+def derive_epoch_key(chain_key: bytes) -> Tuple[ed25519.Ed25519PrivateKey, bytes]:
+    """Dado CK_E, devolve (sk_E, CK_E+1).
+
+    sk_E = HKDF(CK_E, "key") e CK_E+1 = HKDF(CK_E, "next"). O chamador deve guardar
+    CK_E+1 e deitar fora CK_E: quem obtiver CK_E+1 não consegue recuperar sk_E nem CK_E.
+    """
+    if len(chain_key) != 32:
+        raise ValueError("A chave da cadeia tem de ter 32 bytes.")
+    sk_seed = _hkdf32(chain_key, INFO_CHAIN_KEY)
+    next_ck = _hkdf32(chain_key, INFO_CHAIN_NEXT)
+    return ed25519.Ed25519PrivateKey.from_private_bytes(sk_seed), next_ck
+
+
+def derive_epoch_batch(chain_key: bytes, count: int) -> Tuple[list[ed25519.Ed25519PrivateKey], bytes]:
+    """Deriva as chaves de `count` épocas consecutivas e devolve também a CK seguinte."""
+    if count < 1:
+        raise ValueError("count tem de ser pelo menos 1.")
+    keys = []
+    ck = chain_key
+    for _ in range(count):
+        sk, ck = derive_epoch_key(ck)
+        keys.append(sk)
+    return keys, ck
+
+
+# --- HMAC de admissão (K_adm) ---
+
+def _admission_message(epoch_id: int, version: int, rid: bytes, ciphertext: bytes, key_list: bytes) -> bytes:
+    return (
+        DOMAIN_ADMISSION
+        + _pack_with_length(struct.pack(">I", epoch_id))
+        + _pack_with_length(struct.pack(">I", version))
+        + _pack_with_length(rid)
+        + _pack_with_length(envelope_digest(ciphertext, key_list))
+    )
+
+
+def compute_admission_hmac(k_adm: bytes, epoch_id: int, version: int, rid: bytes,
+                           ciphertext: bytes, key_list: bytes) -> bytes:
+    """HMAC-SHA256 de admissão com K_adm, ligado à época, versão, rid e envelope."""
+    return hmac.new(k_adm, _admission_message(epoch_id, version, rid, ciphertext, key_list),
+                    hashlib.sha256).digest()
+
+
+def verify_admission_hmac(k_adm: bytes, epoch_id: int, version: int, rid: bytes,
+                          ciphertext: bytes, key_list: bytes, tag: bytes) -> bool:
+    """Verifica o HMAC de admissão em tempo constante."""
+    expected = compute_admission_hmac(k_adm, epoch_id, version, rid, ciphertext, key_list)
+    return hmac.compare_digest(expected, tag)
