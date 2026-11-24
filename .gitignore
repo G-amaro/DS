@@ -12,3 +12,8 @@ __pycache__/
 # Dados e logs locais
 logs/
 *.log
+
+
+data/ca/
+
+
