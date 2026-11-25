@@ -1,0 +1,35 @@
+Vou explicar com um exemplo, porque a ideia é simples mas a razão de existir não é óbvia.
+
+O problema que a K_adm resolve
+
+O Gateway tem de recusar publicações de membros revogados. Mas o Gateway é anónimo por desenho: não sabe quem está a publicar, só vê uma pk_E e uma credencial válida. E o Coordinator emite credenciais em lote, até 6 épocas (3 dias) de cada vez. Quando revogas o Bob, ele já tem no bolso credenciais válidas, assinadas pelo Coordinator, para os próximos dias. A CRL não ajuda, porque só bloqueia o certificado de login, e publicar não usa esse certificado.
+
+Ou seja: o Bob continua com tudo o que precisa para publicar, e o Gateway não o consegue distinguir de um membro ativo.
+
+A solução: uma senha do "clube"
+
+Pensa numa porta com código. Todos os membros ativos conhecem o código atual (a K_adm). Quem publica prova que sabe o código juntando um HMAC calculado com ele a cada envelope. O Gateway também sabe o código e confere. Não precisa de saber quem és, só que sabes o código.
+
+Quando revogas o Bob, o Coordinator muda o código (versão V+1) e envia o novo, cifrado, a todos os membros ativos menos o Bob, pelo tópico control. O Gateway passa a exigir só o código novo. O Bob continua com as credenciais mas não consegue fabricar um HMAC válido, e o Gateway recusa-o.
+
+Onde está a fraqueza
+
+A K_adm é um segredo partilhado, por isso prova "eu conheço o código", não "eu sou um membro ativo". Se a Alice, que é membro ativo, der o código novo ao Bob, o Bob volta a conseguir publicar. O Gateway não tem como saber.
+
+O que o Bob continua a não conseguir é ler. Ele não consta do diretório V+1, por isso nunca recebe as chaves K_c das mensagens novas. Pode escrever, mas não ler.
+
+Há uma subtileza que convém admitires: se o Bob publicar, as mensagens dele levam uma pk_E das credenciais que ele ainda tem, e numa disputa o Arbiter chega ao Bob. Mas à Alice não chega ninguém, porque o código é igual para todos e não identifica quem o vazou.
+
+A alternativa: blacklist de pk_E
+
+O Coordinator guarda que pk_E deu a cada membro e, ao revogar, entrega ao Gateway as pk_E das épocas que restam, para o Gateway as recusar. Isto é mais forte: o bloqueio é por credencial, e partilhar segredos não ajuda ninguém. O custo é grande: o Coordinator passa a saber qual pk_E é de quem, e perde-se a proteção do anonimato face ao Coordinator. Hoje ele só regista (membro, época), nunca a pk_E.
+
+Como apresentar no relatório
+
+A escolha é uma troca explícita: revogação mais fraca (partilhável por um membro ativo desonesto) em troca de o Coordinator não conseguir ligar membros a pseudónimos. Três pontos a favor de vocês:
+
+o revogado não lê nada, mesmo que volte a publicar;
+a janela de risco é curta, porque a K_adm roda a cada época e a cada revogação;
+só funciona com a cumplicidade de um membro ativo, que é o cenário do enunciado "membros potencialmente maliciosos", e continua a haver controlo de quotas por pk_E no Gateway.
+
+Se o professor perguntar por que não usaram a blacklist, a resposta é essa: preferiram preservar o anonimato perante o Coordinator e aceitaram uma revogação de escrita mais fraca, declarada como limitação.

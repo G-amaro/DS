@@ -1,0 +1,22 @@
+{
+  "1": "ca.py",
+  "4": "test_crypto.py",
+  "6": "test_ca.py",
+  "7": "8. Estado do código",
+  "8": "test_full_report_envelope_flow",
+  "9": "parametrize",
+  "10": "crypto.py",
+  "11": "sign_directory",
+  "12": "CLAUDE.md",
+  "13": "open_vault_inner",
+  "14": "service.py",
+  "17": "generate_ed25519_keypair",
+  "18": "TimestampToken",
+  "19": "sign_pop",
+  "22": "tsa/service.py",
+  "23": "X25519PublicKey",
+  "25": "_sign_hash",
+  "26": "struct",
+  "27": "_build_parser",
+  "28": "Ed25519PrivateKey"
+}

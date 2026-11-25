@@ -15,7 +15,7 @@ def test_aes_gcm_roundtrip():
 
 def test_aes_gcm_nonce_is_random():
     key = c.generate_symmetric_key()
-    assert c.aes_gcm_encrypt(key, b"x") != c.aes_gcm_encrypt(key, b"x")
+    assert c.aes_gcm_encrypt(key, b"x", b"ad") != c.aes_gcm_encrypt(key, b"x", b"ad")
 
 
 def test_aes_gcm_wrong_ad_fails():
@@ -23,6 +23,17 @@ def test_aes_gcm_wrong_ad_fails():
     ct = c.aes_gcm_encrypt(key, b"x", b"ad1")
     with pytest.raises(ValueError):
         c.aes_gcm_decrypt(key, ct, b"ad2")
+
+
+def test_aes_gcm_requires_associated_data():
+    key = c.generate_symmetric_key()
+    with pytest.raises(ValueError):
+        c.aes_gcm_encrypt(key, b"x", None)
+    ct = c.aes_gcm_encrypt(key, b"x", b"ad")
+    with pytest.raises(ValueError):
+        c.aes_gcm_decrypt(key, ct, None)
+    with pytest.raises(TypeError):
+        c.aes_gcm_encrypt(key, b"x")
 
 
 def test_aes_gcm_tampered_fails():
@@ -34,64 +45,82 @@ def test_aes_gcm_tampered_fails():
 
 
 def test_aes_gcm_wrong_key_and_bad_sizes():
-    ct = c.aes_gcm_encrypt(c.generate_symmetric_key(), b"x")
+    ct = c.aes_gcm_encrypt(c.generate_symmetric_key(), b"x", b"ad")
     with pytest.raises(ValueError):
-        c.aes_gcm_decrypt(c.generate_symmetric_key(), ct)
+        c.aes_gcm_decrypt(c.generate_symmetric_key(), ct, b"ad")
     with pytest.raises(ValueError):
-        c.aes_gcm_encrypt(b"curta", b"x")
+        c.aes_gcm_encrypt(b"curta", b"x", b"ad")
     with pytest.raises(ValueError):
-        c.aes_gcm_decrypt(c.generate_symmetric_key(), b"curto")
+        c.aes_gcm_decrypt(c.generate_symmetric_key(), b"curto", b"ad")
 
 
 # --- ECIES ---
 
+def _enc(pk, m=b"m", info=b"A", ad=b"ctx"):
+    return c.ecies_encrypt(pk, m, info=info, associated_data=ad)
+
+
 def test_ecies_roundtrip():
     sk, pk = c.generate_x25519_keypair()
-    ct = c.ecies_encrypt(pk, b"K_c", info=b"A", associated_data=b"ctx")
+    ct = _enc(pk, b"K_c")
     assert c.ecies_decrypt(sk, ct, info=b"A", associated_data=b"ctx") == b"K_c"
 
 
-def test_ecies_defaults_roundtrip():
+def test_ecies_requires_info_and_associated_data():
     sk, pk = c.generate_x25519_keypair()
-    assert c.ecies_decrypt(sk, c.ecies_encrypt(pk, b"m")) == b"m"
+    with pytest.raises(TypeError):
+        c.ecies_encrypt(pk, b"m")
+    with pytest.raises(TypeError):
+        c.ecies_encrypt(pk, b"m", b"A", b"ctx")  # só por nome
+    with pytest.raises(ValueError):
+        c.ecies_encrypt(pk, b"m", info=b"", associated_data=b"ctx")
+    with pytest.raises(ValueError):
+        c.ecies_encrypt(pk, b"m", info=b"A", associated_data=None)
+    ct = _enc(pk)
+    with pytest.raises(ValueError):
+        c.ecies_decrypt(sk, ct, info=b"A", associated_data=None)
 
 
 def test_ecies_wrong_associated_data_fails():
     sk, pk = c.generate_x25519_keypair()
-    ct = c.ecies_encrypt(pk, b"m", associated_data=b"ctx1")
+    ct = _enc(pk, ad=b"ctx1")
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, ct, associated_data=b"ctx2")
-    with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, ct, associated_data=None)
+        c.ecies_decrypt(sk, ct, info=b"A", associated_data=b"ctx2")
 
 
 def test_ecies_wrong_info_fails():
     sk, pk = c.generate_x25519_keypair()
-    ct = c.ecies_encrypt(pk, b"m", info=b"cofre-interior")
+    ct = _enc(pk, info=c.INFO_VAULT_INNER)
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, ct, info=b"cofre-exterior")
+        c.ecies_decrypt(sk, ct, info=c.INFO_VAULT_OUTER, associated_data=b"ctx")
+
+
+def test_ecies_info_constants_are_distinct():
+    infos = [c.INFO_KC, c.INFO_DIRKEY, c.INFO_VAULT_INNER, c.INFO_VAULT_OUTER,
+             c.INFO_CHAIN_KEY, c.INFO_CHAIN_NEXT]
+    assert len(set(infos)) == len(infos)
 
 
 def test_ecies_wrong_recipient_fails():
     _, pk = c.generate_x25519_keypair()
     other_sk, _ = c.generate_x25519_keypair()
     with pytest.raises(ValueError):
-        c.ecies_decrypt(other_sk, c.ecies_encrypt(pk, b"m"))
+        c.ecies_decrypt(other_sk, _enc(pk), info=b"A", associated_data=b"ctx")
 
 
 def test_ecies_tampered_and_short_fail():
     sk, pk = c.generate_x25519_keypair()
-    ct = bytearray(c.ecies_encrypt(pk, b"m"))
+    ct = bytearray(_enc(pk))
     ct[40] ^= 1  # nonce
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, bytes(ct))
+        c.ecies_decrypt(sk, bytes(ct), info=b"A", associated_data=b"ctx")
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, b"curto")
+        c.ecies_decrypt(sk, b"curto", info=b"A", associated_data=b"ctx")
 
 
 def test_ecies_is_randomized():
     _, pk = c.generate_x25519_keypair()
-    assert c.ecies_encrypt(pk, b"m") != c.ecies_encrypt(pk, b"m")
+    assert _enc(pk) != _enc(pk)
 
 
 # --- Serialização de chaves ---
@@ -114,6 +143,18 @@ def test_encrypted_pem_needs_passphrase():
     pem = c.ed25519_private_to_pem(sk, "segredo")
     with pytest.raises(Exception):
         c.ed25519_private_from_pem(pem, "errada")
+
+
+def test_empty_passphrase_rejected():
+    sk, _ = c.generate_ed25519_keypair()
+    xsk, _ = c.generate_x25519_keypair()
+    with pytest.raises(ValueError):
+        c.ed25519_private_to_pem(sk, "")
+    with pytest.raises(ValueError):
+        c.x25519_private_to_pem(xsk, "")
+    pem = c.ed25519_private_to_pem(sk, None)
+    with pytest.raises(ValueError):
+        c.ed25519_private_from_pem(pem, "")
 
 
 def test_wrong_key_type_pem_rejected():
@@ -140,15 +181,18 @@ def test_pop_roundtrip_and_failures():
 
 def test_credential_roundtrip_and_failures():
     csk, cpk = c.generate_ed25519_keypair()
-    _, pk_e = c.generate_ed25519_keypair()
-    pk_raw = c.ed25519_public_to_raw(pk_e)
+    _, pk_E = c.generate_ed25519_keypair()
+    pk_raw = c.ed25519_public_to_raw(pk_E)
     vault = b"cofre"
-    sig = c.sign_credential(csk, 5, pk_raw, vault)
-    assert c.verify_credential(cpk, 5, pk_raw, vault, sig)
-    assert not c.verify_credential(cpk, 6, pk_raw, vault, sig)
-    assert not c.verify_credential(cpk, 5, pk_raw, b"outro cofre", sig)
+    sig = c.sign_credential(csk, 5, pk_raw, vault, 1)
+    assert c.verify_credential(cpk, 5, pk_raw, vault, 1, sig)
+    assert not c.verify_credential(cpk, 6, pk_raw, vault, 1, sig)
+    assert not c.verify_credential(cpk, 5, pk_raw, b"outro cofre", 1, sig)
+    assert not c.verify_credential(cpk, 5, pk_raw, vault, 2, sig)
     other_raw = c.ed25519_public_to_raw(c.generate_ed25519_keypair()[1])
-    assert not c.verify_credential(cpk, 5, other_raw, vault, sig)
+    assert not c.verify_credential(cpk, 5, other_raw, vault, 1, sig)
+    _, other_cpk = c.generate_ed25519_keypair()
+    assert not c.verify_credential(other_cpk, 5, pk_raw, vault, 1, sig)
 
 
 # --- Cofre ---
@@ -164,6 +208,76 @@ def test_vault_payload_truncated_fails():
         c.parse_vault_payload(payload[:-3])
     with pytest.raises(ValueError):
         c.parse_vault_payload(b"\x00\x00")
+    with pytest.raises(ValueError):
+        c.parse_vault_payload(payload + b"x")
+
+
+def _vault_setup():
+    arb_sk, arb_pk = c.generate_x25519_keypair()
+    coord_sk, coord_pk = c.generate_x25519_keypair()
+    _, pk_E = c.generate_ed25519_keypair()
+    pk_raw = c.ed25519_public_to_raw(pk_E)
+    vault = c.seal_vault(arb_pk, coord_pk, 3, "membro-7", pk_raw, 100)
+    return arb_sk, coord_sk, pk_raw, vault
+
+
+def test_two_layer_vault_roundtrip():
+    arb_sk, coord_sk, pk_raw, vault = _vault_setup()
+    inner = c.open_vault_outer(coord_sk, vault, 100, 3)
+    assert c.open_vault_inner(arb_sk, inner, 100, pk_raw) == "membro-7"
+
+
+def test_arbiter_alone_cannot_open_vault():
+    arb_sk, _, pk_raw, vault = _vault_setup()
+    with pytest.raises(ValueError):
+        c.open_vault_inner(arb_sk, vault, 100, pk_raw)
+    with pytest.raises(ValueError):
+        c.open_vault_outer(arb_sk, vault, 100, 3)
+
+
+def test_coordinator_alone_cannot_read_vault():
+    _, coord_sk, pk_raw, vault = _vault_setup()
+    inner = c.open_vault_outer(coord_sk, vault, 100, 3)
+    with pytest.raises(ValueError):
+        c.open_vault_inner(coord_sk, inner, 100, pk_raw)
+
+
+def test_vault_outer_bound_to_epoch_and_key_gen():
+    _, coord_sk, _, vault = _vault_setup()
+    with pytest.raises(ValueError):
+        c.open_vault_outer(coord_sk, vault, 101, 3)
+    with pytest.raises(ValueError):
+        c.open_vault_outer(coord_sk, vault, 100, 4)
+
+
+def test_vault_inner_bound_to_pk_E_and_epoch():
+    arb_sk, coord_sk, pk_raw, vault = _vault_setup()
+    inner = c.open_vault_outer(coord_sk, vault, 100, 3)
+    other_raw = c.ed25519_public_to_raw(c.generate_ed25519_keypair()[1])
+    with pytest.raises(ValueError):
+        c.open_vault_inner(arb_sk, inner, 100, other_raw)
+    with pytest.raises(ValueError):
+        c.open_vault_inner(arb_sk, inner, 101, pk_raw)
+
+
+def test_vault_inner_rejects_mismatched_content():
+    """Um cofre construído à mão com pk_E diferente da dos dados associados é recusado."""
+    arb_sk, arb_pk = c.generate_x25519_keypair()
+    pk_raw = b"\x01" * 32
+    payload = c.build_vault_payload("m", b"\x02" * 32, 100)
+    inner = c.ecies_encrypt(arb_pk, payload, info=c.INFO_VAULT_INNER,
+                            associated_data=c._vault_inner_aad(100, pk_raw))
+    with pytest.raises(ValueError):
+        c.open_vault_inner(arb_sk, inner, 100, pk_raw)
+
+
+def test_vault_in_credential_flow():
+    csk, cpk = c.generate_ed25519_keypair()
+    arb_sk, coord_sk, pk_raw, vault = _vault_setup()
+    sig = c.sign_credential(csk, 100, pk_raw, vault, 3)
+    assert c.verify_credential(cpk, 100, pk_raw, vault, 3, sig)
+    _, other_vault = _vault_setup()[2:]
+    assert not c.verify_credential(cpk, 100, pk_raw, other_vault, 3, sig)
 
 
 # --- rid e lista de chaves ---
@@ -352,38 +466,100 @@ def test_admission_hmac_boundary_not_ambiguous():
     assert not c.verify_admission_hmac(k, 1, 1, rid, b"a", b"bc", tag)
 
 
+# --- Entrega de K_c e K_adm ---
+
+def test_content_key_bound_to_context():
+    sk, pk = c.generate_x25519_keypair()
+    k_c = c.generate_symmetric_key()
+    rid = c.compute_rid("id")
+    w = c.wrap_content_key(pk, k_c, 10, rid, 2)
+    assert c.unwrap_content_key(sk, w, 10, rid, 2) == k_c
+    for e, r, v in [(11, rid, 2), (10, c.compute_rid("x"), 2), (10, rid, 3)]:
+        with pytest.raises(ValueError):
+            c.unwrap_content_key(sk, w, e, r, v)
+
+
+def test_k_adm_bound_to_version_and_usage():
+    sk, pk = c.generate_x25519_keypair()
+    k_adm = c.generate_symmetric_key()
+    w = c.wrap_k_adm(pk, k_adm, 5)
+    assert c.unwrap_k_adm(sk, w, 5) == k_adm
+    with pytest.raises(ValueError):
+        c.unwrap_k_adm(sk, w, 6)
+    # Um criptograma de K_adm não passa por K_c (info diferente), e vice-versa
+    with pytest.raises(ValueError):
+        c.ecies_decrypt(sk, w, info=c.INFO_KC, associated_data=c._u32(5))
+    wk = c.wrap_content_key(pk, k_adm, 0, b"", 5)
+    with pytest.raises(ValueError):
+        c.unwrap_k_adm(sk, wk, 5)
+
+
+def test_unwrap_from_key_list_not_member():
+    members = [c.generate_x25519_keypair() for _ in range(2)]
+    raws = [c.x25519_public_to_raw(pk) for _, pk in members]
+    rid = c.compute_rid("id")
+    k_c = c.generate_symmetric_key()
+    kl = c.build_key_list(raws, k_c, 1, rid, 1)
+    for sk, _ in members:
+        assert c.unwrap_from_key_list(sk, kl, 1, rid, 1) == k_c
+    outsider_sk, _ = c.generate_x25519_keypair()
+    with pytest.raises(ValueError):
+        c.unwrap_from_key_list(outsider_sk, kl, 1, rid, 1)
+
+
+# --- Épocas ---
+
+def test_epoch_boundaries_at_00_and_12_utc():
+    from datetime import datetime, timedelta, timezone
+    utc = timezone.utc
+    noon = datetime(2026, 11, 25, 12, 0, tzinfo=utc)
+    e = c.epoch_id_for(noon)
+    assert c.epoch_id_for(noon - timedelta(microseconds=1)) == e - 1
+    assert c.epoch_id_for(datetime(2026, 11, 25, 23, 59, 59, tzinfo=utc)) == e
+    assert c.epoch_id_for(datetime(2026, 11, 26, 0, 0, tzinfo=utc)) == e + 1
+    start, end = c.epoch_bounds(e)
+    assert start == noon and end == noon + timedelta(hours=12)
+
+
+def test_epoch_respects_timezone_and_rejects_naive():
+    from datetime import datetime, timedelta, timezone
+    lisbon_summer = timezone(timedelta(hours=1))
+    assert c.epoch_id_for(datetime(2026, 7, 1, 13, 0, tzinfo=lisbon_summer)) == \
+        c.epoch_id_for(datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc))
+    with pytest.raises(ValueError):
+        c.epoch_id_for(datetime(2026, 7, 1, 12, 0))
+    with pytest.raises(ValueError):
+        c.epoch_bounds(-1)
+    assert isinstance(c.current_epoch(), int)
+
+
 # --- Fluxo completo: envelope de relatório ---
 
 def test_full_report_envelope_flow():
     members = [c.generate_x25519_keypair() for _ in range(3)]
-    sk_e, pk_e = c.generate_ed25519_keypair()
+    raws = [c.x25519_public_to_raw(pub) for _, pub in members]
+    sk_E, pk_E = c.generate_ed25519_keypair()
     k_adm = c.generate_symmetric_key()
     epoch, version = 10, 2
     rid = c.compute_rid("uuid-do-relatorio")
 
     k_c = c.generate_symmetric_key()
     ct = c.aes_gcm_encrypt(k_c, b'{"severity":"high"}', c.report_aad(epoch, rid, version))
-    entries = []
-    for _, pub in members:
-        raw = c.x25519_public_to_raw(pub)
-        entries.append((c.recipient_key_id(raw), c.ecies_encrypt(pub, k_c, associated_data=rid)))
-    kl = c.serialize_key_list(entries)
-    sig = c.sign_report(sk_e, epoch, version, rid, ct, kl)
+    kl = c.build_key_list(raws, k_c, epoch, rid, version)
+    sig = c.sign_report(sk_E, epoch, version, rid, ct, kl)
     tag = c.compute_admission_hmac(k_adm, epoch, version, rid, ct, kl)
 
     # Gateway
     assert c.verify_admission_hmac(k_adm, epoch, version, rid, ct, kl, tag)
-    assert c.verify_report(pk_e, epoch, version, rid, ct, kl, sig)
+    assert c.verify_report(pk_E, epoch, version, rid, ct, kl, sig)
 
     # Cada membro encontra a sua entrada e decifra
-    parsed = c.parse_key_list(kl)
-    for sk, pub in members:
-        kid = c.recipient_key_id(c.x25519_public_to_raw(pub))
-        wrapped = dict(parsed)[kid]
-        got_kc = c.ecies_decrypt(sk, wrapped, associated_data=rid)
+    for sk, _ in members:
+        got_kc = c.unwrap_from_key_list(sk, kl, epoch, rid, version)
         assert c.aes_gcm_decrypt(got_kc, ct, c.report_aad(epoch, rid, version)) == b'{"severity":"high"}'
 
-    # Um não-membro (revogado) não decifra
+    # Um não-membro (revogado) não decifra nenhuma entrada
     outsider_sk, _ = c.generate_x25519_keypair()
-    with pytest.raises(ValueError):
-        c.ecies_decrypt(outsider_sk, parsed[0][1], associated_data=rid)
+    for _, wrapped in c.parse_key_list(kl):
+        with pytest.raises(ValueError):
+            c.unwrap_content_key(outsider_sk, wrapped, epoch, rid, version)
