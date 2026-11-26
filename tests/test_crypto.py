@@ -1,8 +1,20 @@
 """Testes unitários das primitivas de crypto.py (passo 1 do plano)."""
 
+from functools import cache
+
 import pytest
 
 from src.common import crypto as c
+
+
+@cache
+def _rsa(i: int = 0):
+    """Pares RSA-3072 reutilizados entre testes (gerá-los é lento)."""
+    return c.generate_rsa_keypair()
+
+
+def _der(pk) -> bytes:
+    return c.rsa_public_to_der(pk)
 
 
 # --- AES-GCM ---
@@ -54,73 +66,119 @@ def test_aes_gcm_wrong_key_and_bad_sizes():
         c.aes_gcm_decrypt(c.generate_symmetric_key(), b"curto", b"ad")
 
 
-# --- ECIES ---
+# --- RSA-OAEP ---
 
-def _enc(pk, m=b"m", info=b"A", ad=b"ctx"):
-    return c.ecies_encrypt(pk, m, info=info, associated_data=ad)
-
-
-def test_ecies_roundtrip():
-    sk, pk = c.generate_x25519_keypair()
-    ct = _enc(pk, b"K_c")
-    assert c.ecies_decrypt(sk, ct, info=b"A", associated_data=b"ctx") == b"K_c"
+def test_rsa_oaep_roundtrip():
+    sk, pk = _rsa()
+    ct = c.rsa_oaep_encrypt(pk, b"K_c" * 10, label=b"A")
+    assert len(ct) == 384
+    assert c.rsa_oaep_decrypt(sk, ct, label=b"A") == b"K_c" * 10
 
 
-def test_ecies_requires_info_and_associated_data():
-    sk, pk = c.generate_x25519_keypair()
+def test_rsa_oaep_requires_label():
+    sk, pk = _rsa()
     with pytest.raises(TypeError):
-        c.ecies_encrypt(pk, b"m")
+        c.rsa_oaep_encrypt(pk, b"m")
     with pytest.raises(TypeError):
-        c.ecies_encrypt(pk, b"m", b"A", b"ctx")  # só por nome
+        c.rsa_oaep_encrypt(pk, b"m", b"A")  # só por nome
     with pytest.raises(ValueError):
-        c.ecies_encrypt(pk, b"m", info=b"", associated_data=b"ctx")
+        c.rsa_oaep_encrypt(pk, b"m", label=b"")
     with pytest.raises(ValueError):
-        c.ecies_encrypt(pk, b"m", info=b"A", associated_data=None)
-    ct = _enc(pk)
+        c.rsa_oaep_encrypt(pk, b"m", label=None)
+    ct = c.rsa_oaep_encrypt(pk, b"m", label=b"A")
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, ct, info=b"A", associated_data=None)
+        c.rsa_oaep_decrypt(sk, ct, label=b"")
 
 
-def test_ecies_wrong_associated_data_fails():
-    sk, pk = c.generate_x25519_keypair()
-    ct = _enc(pk, ad=b"ctx1")
+def test_rsa_oaep_wrong_label_fails():
+    sk, pk = _rsa()
+    ct = c.rsa_oaep_encrypt(pk, b"m", label=c.LABEL_VAULT_INNER)
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, ct, info=b"A", associated_data=b"ctx2")
+        c.rsa_oaep_decrypt(sk, ct, label=c.LABEL_VAULT_OUTER)
 
 
-def test_ecies_wrong_info_fails():
-    sk, pk = c.generate_x25519_keypair()
-    ct = _enc(pk, info=c.INFO_VAULT_INNER)
+def test_labels_are_distinct():
+    labels = [c.LABEL_KC, c.LABEL_KADM, c.LABEL_VAULT_INNER, c.LABEL_VAULT_OUTER,
+              c.HKDF_CHAIN_KEY, c.HKDF_CHAIN_NEXT]
+    assert len(set(labels)) == len(labels)
+
+
+def test_rsa_oaep_wrong_recipient_fails():
+    _, pk = _rsa(0)
+    other_sk, _ = _rsa(1)
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, ct, info=c.INFO_VAULT_OUTER, associated_data=b"ctx")
+        c.rsa_oaep_decrypt(other_sk, c.rsa_oaep_encrypt(pk, b"m", label=b"A"), label=b"A")
 
 
-def test_ecies_info_constants_are_distinct():
-    infos = [c.INFO_KC, c.INFO_DIRKEY, c.INFO_VAULT_INNER, c.INFO_VAULT_OUTER,
-             c.INFO_CHAIN_KEY, c.INFO_CHAIN_NEXT]
-    assert len(set(infos)) == len(infos)
-
-
-def test_ecies_wrong_recipient_fails():
-    _, pk = c.generate_x25519_keypair()
-    other_sk, _ = c.generate_x25519_keypair()
+def test_rsa_oaep_tampered_and_bad_size_fail():
+    sk, pk = _rsa()
+    ct = bytearray(c.rsa_oaep_encrypt(pk, b"m", label=b"A"))
+    ct[10] ^= 1
     with pytest.raises(ValueError):
-        c.ecies_decrypt(other_sk, _enc(pk), info=b"A", associated_data=b"ctx")
-
-
-def test_ecies_tampered_and_short_fail():
-    sk, pk = c.generate_x25519_keypair()
-    ct = bytearray(_enc(pk))
-    ct[40] ^= 1  # nonce
+        c.rsa_oaep_decrypt(sk, bytes(ct), label=b"A")
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, bytes(ct), info=b"A", associated_data=b"ctx")
+        c.rsa_oaep_decrypt(sk, b"curto", label=b"A")
+
+
+def test_rsa_oaep_is_randomized():
+    _, pk = _rsa()
+    assert c.rsa_oaep_encrypt(pk, b"m", label=b"A") != c.rsa_oaep_encrypt(pk, b"m", label=b"A")
+
+
+def test_weak_rsa_keys_rejected():
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    weak = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, b"curto", info=b"A", associated_data=b"ctx")
+        c.generate_rsa_keypair(2048)
+    with pytest.raises(ValueError):
+        c.rsa_oaep_encrypt(weak.public_key(), b"m", label=b"A")
+    with pytest.raises(ValueError):
+        c.rsa_public_to_der(weak.public_key())
+    with pytest.raises(ValueError):
+        c.rsa_private_from_pem(weak.private_bytes(
+            c.serialization.Encoding.PEM, c.serialization.PrivateFormat.PKCS8,
+            c.serialization.NoEncryption()))
 
 
-def test_ecies_is_randomized():
-    _, pk = c.generate_x25519_keypair()
-    assert _enc(pk) != _enc(pk)
+# --- Cifra híbrida ---
+
+def test_hybrid_roundtrip_large_payload():
+    sk, pk = _rsa()
+    data = b"x" * 5000  # muito maior do que um bloco RSA
+    ct = c.hybrid_encrypt(pk, data, label=b"A", associated_data=b"ctx")
+    assert c.hybrid_decrypt(sk, ct, label=b"A", associated_data=b"ctx") == data
+
+
+def test_hybrid_requires_label_and_associated_data():
+    sk, pk = _rsa()
+    with pytest.raises(TypeError):
+        c.hybrid_encrypt(pk, b"m", label=b"A")
+    with pytest.raises(ValueError):
+        c.hybrid_encrypt(pk, b"m", label=b"", associated_data=b"ctx")
+    with pytest.raises(ValueError):
+        c.hybrid_encrypt(pk, b"m", label=b"A", associated_data=None)
+    ct = c.hybrid_encrypt(pk, b"m", label=b"A", associated_data=b"ctx")
+    with pytest.raises(ValueError):
+        c.hybrid_decrypt(sk, ct, label=b"A", associated_data=None)
+
+
+def test_hybrid_bound_to_label_and_associated_data():
+    sk, pk = _rsa()
+    ct = c.hybrid_encrypt(pk, b"m", label=b"A", associated_data=b"ctx1")
+    with pytest.raises(ValueError):
+        c.hybrid_decrypt(sk, ct, label=b"B", associated_data=b"ctx1")
+    with pytest.raises(ValueError):
+        c.hybrid_decrypt(sk, ct, label=b"A", associated_data=b"ctx2")
+
+
+def test_hybrid_tampered_and_truncated_fail():
+    sk, pk = _rsa()
+    ct = c.hybrid_encrypt(pk, b"m", label=b"A", associated_data=b"ctx")
+    bad = bytearray(ct)
+    bad[-1] ^= 1
+    for payload in (bytes(bad), ct[:3], ct[:200], ct[:4 + 384 + 10]):
+        with pytest.raises(ValueError):
+            c.hybrid_decrypt(sk, payload, label=b"A", associated_data=b"ctx")
 
 
 # --- Serialização de chaves ---
@@ -132,10 +190,12 @@ def test_pem_roundtrips_with_and_without_passphrase():
         assert c.ed25519_private_from_pem(pem, pw).sign(b"m") == sk.sign(b"m")
     assert c.ed25519_public_to_raw(c.ed25519_public_from_pem(c.ed25519_public_to_pem(pk))) == c.ed25519_public_to_raw(pk)
 
-    xsk, xpk = c.generate_x25519_keypair()
-    pem = c.x25519_private_to_pem(xsk, "segredo")
-    assert c.x25519_public_to_raw(c.x25519_private_from_pem(pem, "segredo").public_key()) == c.x25519_public_to_raw(xpk)
-    assert c.x25519_public_to_raw(c.x25519_public_from_pem(c.x25519_public_to_pem(xpk))) == c.x25519_public_to_raw(xpk)
+    rsk, rpk = _rsa()
+    for pw in (None, "segredo"):
+        pem = c.rsa_private_to_pem(rsk, pw)
+        assert _der(c.rsa_private_from_pem(pem, pw).public_key()) == _der(rpk)
+    assert _der(c.rsa_public_from_pem(c.rsa_public_to_pem(rpk))) == _der(rpk)
+    assert _der(c.rsa_public_from_der(_der(rpk))) == _der(rpk)
 
 
 def test_encrypted_pem_needs_passphrase():
@@ -147,22 +207,27 @@ def test_encrypted_pem_needs_passphrase():
 
 def test_empty_passphrase_rejected():
     sk, _ = c.generate_ed25519_keypair()
-    xsk, _ = c.generate_x25519_keypair()
+    rsk, _ = _rsa()
     with pytest.raises(ValueError):
         c.ed25519_private_to_pem(sk, "")
     with pytest.raises(ValueError):
-        c.x25519_private_to_pem(xsk, "")
+        c.rsa_private_to_pem(rsk, "")
     pem = c.ed25519_private_to_pem(sk, None)
     with pytest.raises(ValueError):
         c.ed25519_private_from_pem(pem, "")
 
 
 def test_wrong_key_type_pem_rejected():
-    xsk, xpk = c.generate_x25519_keypair()
+    rsk, rpk = _rsa()
+    esk, epk = c.generate_ed25519_keypair()
     with pytest.raises(ValueError):
-        c.ed25519_private_from_pem(c.x25519_private_to_pem(xsk))
+        c.ed25519_private_from_pem(c.rsa_private_to_pem(rsk))
     with pytest.raises(ValueError):
-        c.ed25519_public_from_pem(c.x25519_public_to_pem(xpk))
+        c.ed25519_public_from_pem(c.rsa_public_to_pem(rpk))
+    with pytest.raises(ValueError):
+        c.rsa_private_from_pem(c.ed25519_private_to_pem(esk))
+    with pytest.raises(ValueError):
+        c.rsa_public_from_pem(c.ed25519_public_to_pem(epk))
 
 
 # --- Prova de posse ---
@@ -213,8 +278,8 @@ def test_vault_payload_truncated_fails():
 
 
 def _vault_setup():
-    arb_sk, arb_pk = c.generate_x25519_keypair()
-    coord_sk, coord_pk = c.generate_x25519_keypair()
+    arb_sk, arb_pk = _rsa(0)
+    coord_sk, coord_pk = _rsa(1)
     _, pk_E = c.generate_ed25519_keypair()
     pk_raw = c.ed25519_public_to_raw(pk_E)
     vault = c.seal_vault(arb_pk, coord_pk, 3, "membro-7", pk_raw, 100)
@@ -262,11 +327,11 @@ def test_vault_inner_bound_to_pk_E_and_epoch():
 
 def test_vault_inner_rejects_mismatched_content():
     """Um cofre construído à mão com pk_E diferente da dos dados associados é recusado."""
-    arb_sk, arb_pk = c.generate_x25519_keypair()
+    arb_sk, arb_pk = _rsa(0)
     pk_raw = b"\x01" * 32
     payload = c.build_vault_payload("m", b"\x02" * 32, 100)
-    inner = c.ecies_encrypt(arb_pk, payload, info=c.INFO_VAULT_INNER,
-                            associated_data=c._vault_inner_aad(100, pk_raw))
+    inner = c.hybrid_encrypt(arb_pk, payload, label=c.LABEL_VAULT_INNER,
+                             associated_data=c._vault_inner_aad(100, pk_raw))
     with pytest.raises(ValueError):
         c.open_vault_inner(arb_sk, inner, 100, pk_raw)
 
@@ -468,43 +533,62 @@ def test_admission_hmac_boundary_not_ambiguous():
 
 # --- Entrega de K_c e K_adm ---
 
-def test_content_key_bound_to_context():
-    sk, pk = c.generate_x25519_keypair()
+def test_content_key_bound_to_rid():
+    sk, pk = _rsa()
     k_c = c.generate_symmetric_key()
     rid = c.compute_rid("id")
     w = c.wrap_content_key(pk, k_c, 10, rid, 2)
+    assert len(w) == 384  # 384 B por destinatário (RSA-3072)
     assert c.unwrap_content_key(sk, w, 10, rid, 2) == k_c
-    for e, r, v in [(11, rid, 2), (10, c.compute_rid("x"), 2), (10, rid, 3)]:
-        with pytest.raises(ValueError):
-            c.unwrap_content_key(sk, w, e, r, v)
+    with pytest.raises(ValueError):
+        c.unwrap_content_key(sk, w, 10, c.compute_rid("x"), 2)
+    with pytest.raises(ValueError):
+        c.wrap_content_key(pk, b"curta", 10, rid, 2)
+
+
+def test_content_key_label_is_kc_plus_rid():
+    sk, pk = _rsa()
+    rid = c.compute_rid("id")
+    k_c = c.generate_symmetric_key()
+    w = c.rsa_oaep_encrypt(pk, k_c, label=c.LABEL_KC + c._pack_with_length(rid))
+    assert c.unwrap_content_key(sk, w, 0, rid, 0) == k_c
 
 
 def test_k_adm_bound_to_version_and_usage():
-    sk, pk = c.generate_x25519_keypair()
+    sk, pk = _rsa()
     k_adm = c.generate_symmetric_key()
     w = c.wrap_k_adm(pk, k_adm, 5)
     assert c.unwrap_k_adm(sk, w, 5) == k_adm
     with pytest.raises(ValueError):
         c.unwrap_k_adm(sk, w, 6)
-    # Um criptograma de K_adm não passa por K_c (info diferente), e vice-versa
+    assert c.rsa_oaep_decrypt(sk, w, label=c.LABEL_KADM + c._u32(5)) == k_adm
+    # Um criptograma de K_adm não passa por K_c (label diferente), e vice-versa
     with pytest.raises(ValueError):
-        c.ecies_decrypt(sk, w, info=c.INFO_KC, associated_data=c._u32(5))
-    wk = c.wrap_content_key(pk, k_adm, 0, b"", 5)
+        c.unwrap_content_key(sk, w, 0, c._u32(5), 5)
+    wk = c.wrap_content_key(pk, k_adm, 0, c._u32(5), 5)
     with pytest.raises(ValueError):
         c.unwrap_k_adm(sk, wk, 5)
 
 
 def test_unwrap_from_key_list_not_member():
-    members = [c.generate_x25519_keypair() for _ in range(2)]
-    raws = [c.x25519_public_to_raw(pk) for _, pk in members]
+    members = [_rsa(0), _rsa(1)]
+    ders = [_der(pk) for _, pk in members]
     rid = c.compute_rid("id")
     k_c = c.generate_symmetric_key()
-    kl = c.build_key_list(raws, k_c, 1, rid, 1)
+    kl = c.build_key_list(ders, k_c, 1, rid, 1)
     for sk, _ in members:
         assert c.unwrap_from_key_list(sk, kl, 1, rid, 1) == k_c
-    outsider_sk, _ = c.generate_x25519_keypair()
+    outsider_sk, _ = _rsa(2)
     with pytest.raises(ValueError):
         c.unwrap_from_key_list(outsider_sk, kl, 1, rid, 1)
+
+
+def test_build_key_list_rejects_non_rsa_keys():
+    _, epk = c.generate_ed25519_keypair()
+    der = epk.public_bytes(c.serialization.Encoding.DER,
+                           c.serialization.PublicFormat.SubjectPublicKeyInfo)
+    with pytest.raises(ValueError):
+        c.build_key_list([der], c.generate_symmetric_key(), 1, c.compute_rid("id"), 1)
 
 
 # --- Épocas ---
@@ -536,8 +620,8 @@ def test_epoch_respects_timezone_and_rejects_naive():
 # --- Fluxo completo: envelope de relatório ---
 
 def test_full_report_envelope_flow():
-    members = [c.generate_x25519_keypair() for _ in range(3)]
-    raws = [c.x25519_public_to_raw(pub) for _, pub in members]
+    members = [_rsa(i) for i in range(3)]
+    raws = [_der(pub) for _, pub in members]
     sk_E, pk_E = c.generate_ed25519_keypair()
     k_adm = c.generate_symmetric_key()
     epoch, version = 10, 2
@@ -559,7 +643,7 @@ def test_full_report_envelope_flow():
         assert c.aes_gcm_decrypt(got_kc, ct, c.report_aad(epoch, rid, version)) == b'{"severity":"high"}'
 
     # Um não-membro (revogado) não decifra nenhuma entrada
-    outsider_sk, _ = c.generate_x25519_keypair()
+    outsider_sk, _ = _rsa(3)
     for _, wrapped in c.parse_key_list(kl):
         with pytest.raises(ValueError):
             c.unwrap_content_key(outsider_sk, wrapped, epoch, rid, version)

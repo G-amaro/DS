@@ -1,309 +1,324 @@
-"""Testes da TSA (token simplificado Ed25519). Correr a partir da raiz: python -m pytest."""
+"""Testes da TSA RFC 3161 (openssl ts). Correr a partir da raiz: python -m pytest.
 
-import base64
+Precisam de OpenSSL >= 3 no PATH (ou em FED_OPENSSL); sem ele são ignorados.
+"""
+
 import hashlib
+import subprocess
 import threading
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import pytest
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from src.ca import ca as ca_mod
 from src.ca.ca import CertificateAuthority
 from src.tsa import tsa as tsa_mod
 from src.tsa.service import create_app
-from src.tsa.tsa import TimestampAuthority, TimestampToken, TokenError, TSAError
+from src.tsa.tsa import TimestampAuthority, TokenError, TSAError
+
+pytestmark = pytest.mark.skipif(not tsa_mod.openssl_available(),
+                                reason="requer OpenSSL >= 3 (defina FED_OPENSSL)")
 
 PW = "pw"
-T0 = datetime(2026, 11, 24, 12, 0, 0, tzinfo=timezone.utc)
 H = hashlib.sha256(b"envelope").digest()
 
 
-class Clock:
-    def __init__(self, t=T0):
-        self.t = t
+@pytest.fixture(scope="module")
+def tsa_key():
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
-    def __call__(self):
-        return self.t
+
+@pytest.fixture(scope="module")
+def ca(tmp_path_factory):
+    return CertificateAuthority.init(tmp_path_factory.mktemp("ca") / "ca", PW)
+
+
+def _write(tmp_path, key, cert, passphrase=None, name="tsa"):
+    enc = (serialization.BestAvailableEncryption(passphrase.encode())
+           if passphrase else serialization.NoEncryption())
+    key_path, cert_path = tmp_path / f"{name}.key", tmp_path / f"{name}.pem"
+    key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+                                           serialization.PrivateFormat.PKCS8, enc))
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    return key_path, cert_path
+
+
+def _make_tsa(ca, tmp_path, key, passphrase="segredo", state="state", **kw):
+    _, csr = ca_mod.generate_csr("tsa", key)
+    cert = ca.issue_tsa_cert(csr, "tsa")
+    key_path, cert_path = _write(tmp_path, key, cert, passphrase)
+    return TimestampAuthority(key_path, cert_path, tmp_path / state, passphrase=passphrase, **kw)
 
 
 @pytest.fixture
-def ca(tmp_path):
-    return CertificateAuthority.init(tmp_path / "ca", PW, now=T0)
+def tsa(ca, tmp_path, tsa_key):
+    return _make_tsa(ca, tmp_path, tsa_key)
 
 
-def _make_tsa(ca, tmp_path, clock, name="tsa", days=365, state="state.json"):
-    key = ed25519.Ed25519PrivateKey.generate()
-    _, csr = ca_mod.generate_csr(name, key)
-    cert = ca.issue_tsa_cert(csr, name, days=days, now=T0)
-    return TimestampAuthority(key, cert, tmp_path / state, clock), key, cert
-
-
-@pytest.fixture
-def clock():
-    return Clock()
-
-
-@pytest.fixture
-def tsa(ca, tmp_path, clock):
-    return _make_tsa(ca, tmp_path, clock)[0]
+def _stamp(tsa, imprint=H):
+    req = tsa_mod.create_request(imprint)
+    return req, tsa_mod.token_from_response(tsa.stamp(req.der))
 
 
 # --- Emissão e verificação ---
 
-def test_stamp_and_verify(tsa, ca, clock):
-    tok = tsa.stamp(H)
-    assert tok.serial == 1 and tok.imprint == H and tok.nonce == b""
-    assert tsa_mod.verify_token(tok, ca.cert, H, now=clock.t) == T0
-    assert tok.gen_time_iso == "2026-11-24T12:00:00.000Z"
+def test_stamp_and_verify(tsa, ca):
+    req, token = _stamp(tsa)
+    info = tsa_mod.verify_token(token, ca.cert, H, nonce=req.nonce, policy=tsa_mod.DEFAULT_POLICY_OID)
+    assert info.serial == 1 and info.imprint == H and info.nonce == req.nonce
+    assert info.policy == tsa_mod.DEFAULT_POLICY_OID
+    assert abs(info.gen_time - tsa_mod._utcnow()) < timedelta(minutes=1)
+    assert info.gen_time_iso.endswith("Z") and len(info.gen_time_iso) == 24
+
+
+def test_members_verify_without_nonce(tsa, ca):
+    """Membros e Arbiter não conhecem o nonce do Gateway: basta o hash e a raiz da CA."""
+    _, token = _stamp(tsa)
+    assert tsa_mod.verify_token(token, ca.cert, H).serial == 1
 
 
 def test_serials_strictly_increase(tsa):
-    assert [tsa.stamp(H).serial for _ in range(5)] == [1, 2, 3, 4, 5]
+    assert [tsa_mod.parse_token(_stamp(tsa)[1]).serial for _ in range(4)] == [1, 2, 3, 4]
+    assert tsa.last_serial() == 4
 
 
-def test_time_never_goes_backwards(tsa, clock):
-    first = tsa.stamp(H)
-    clock.t = T0 - timedelta(minutes=1)  # ainda dentro da validade do certificado
-    second = tsa.stamp(H)
-    assert second.gen_time_ms == first.gen_time_ms and second.serial == first.serial + 1
+def test_serial_persists_across_restart(ca, tmp_path, tsa_key):
+    tsa1 = _make_tsa(ca, tmp_path, tsa_key)
+    _stamp(tsa1)
+    _stamp(tsa1)
+    tsa2 = _make_tsa(ca, tmp_path, tsa_key)
+    assert tsa_mod.parse_token(_stamp(tsa2)[1]).serial == 3
 
 
-def test_serial_persists_across_restart(ca, tmp_path, clock):
-    tsa1, key, cert = _make_tsa(ca, tmp_path, clock)
-    tsa1.stamp(H)
-    tsa1.stamp(H)
-    tsa2 = TimestampAuthority(key, cert, tmp_path / "state.json", clock)
-    assert tsa2.stamp(H).serial == 3
-
-
-def test_corrupt_state_fails_closed(ca, tmp_path, clock):
-    tsa1, key, cert = _make_tsa(ca, tmp_path, clock)
-    tsa1.stamp(H)
-    (tmp_path / "state.json").write_text("{lixo")
+def test_corrupt_serial_fails_closed(ca, tmp_path, tsa_key):
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / tsa_mod.SERIAL_FILE).write_text("isto não é hex")
     with pytest.raises(TSAError):
-        TimestampAuthority(key, cert, tmp_path / "state.json", clock)
-    (tmp_path / "state.json").write_text('{"last_serial": -1, "last_time_ms": 0}')
+        _make_tsa(ca, tmp_path, tsa_key)
+
+
+def test_deleted_serial_fails_closed(tsa):
+    _stamp(tsa)
+    tsa._serial_path.unlink()
     with pytest.raises(TSAError):
-        TimestampAuthority(key, cert, tmp_path / "state.json", clock)
+        _stamp(tsa)
 
 
 def test_concurrent_stamps_have_unique_serials(tsa):
-    serials, lock = [], threading.Lock()
+    serials, errors = [], []
 
     def work():
-        for _ in range(10):
-            s = tsa.stamp(H).serial
-            with lock:
-                serials.append(s)
+        try:
+            serials.append(tsa_mod.parse_token(_stamp(tsa)[1]).serial)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
 
-    threads = [threading.Thread(target=work) for _ in range(8)]
-    [t.start() for t in threads]
-    [t.join() for t in threads]
-    assert sorted(serials) == list(range(1, 81))
+    threads = [threading.Thread(target=work) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and sorted(serials) == list(range(1, 7))
 
 
-def test_input_validation(tsa):
+def test_unencrypted_key_supported(ca, tmp_path, tsa_key):
+    tsa = _make_tsa(ca, tmp_path, tsa_key, passphrase=None)
+    assert tsa_mod.parse_token(_stamp(tsa)[1]).serial == 1
+
+
+# --- Pedido ---
+
+def test_request_is_valid_rfc3161_for_openssl(tmp_path):
+    req = tsa_mod.create_request(H, nonce=0x1234)
+    path = tmp_path / "req.tsq"
+    path.write_bytes(req.der)
+    out = subprocess.run([tsa_mod.OPENSSL, "ts", "-query", "-in", str(path), "-text"],
+                         capture_output=True, check=True).stdout.decode()
+    assert "sha256" in out and "0x1234" in out and "Certificate required: yes" in out
+    assert tsa_mod.parse_request(req.der).nonce == 0x1234
+
+
+def test_request_nonce_is_random():
+    assert tsa_mod.create_request(H).nonce != tsa_mod.create_request(H).nonce
+
+
+def test_request_validation(tsa):
     with pytest.raises(TSAError):
-        tsa.stamp(b"curto")
+        tsa_mod.create_request(b"curto")
+    for bad in (b"", b"lixo", b"\x30\x00", b"\x30" + b"\x82\xff\xff", b"x" * 5000):
+        with pytest.raises(TSAError):
+            tsa.stamp(bad)
+
+
+def test_non_sha256_request_rejected(tsa):
+    sha1_oid = bytes.fromhex("2b0e03021a")
+    der = tsa_mod.create_request(H).der.replace(
+        tsa_mod._tlv(0x06, tsa_mod._OID_SHA256), tsa_mod._tlv(0x06, sha1_oid))
     with pytest.raises(TSAError):
-        tsa.stamp(H, nonce=b"x" * 65)
+        tsa.stamp(der)
 
 
-def test_tsa_refuses_to_stamp_outside_cert_validity(ca, tmp_path, clock):
-    tsa, _, cert = _make_tsa(ca, tmp_path, clock, days=1)
-    clock.t = T0 + timedelta(days=2)
+# --- Configuração da TSA ---
+
+def test_constructor_rejects_bad_setup(ca, tmp_path, tsa_key):
+    # Chave que não corresponde ao certificado
+    _, csr = ca_mod.generate_csr("tsa", tsa_key)
+    cert = ca.issue_tsa_cert(csr, "tsa")
+    other = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    k, c = _write(tmp_path, other, cert, name="mismatch")
     with pytest.raises(TSAError):
-        tsa.stamp(H)
+        TimestampAuthority(k, c, tmp_path / "s1")
 
-
-# --- Configuração ---
-
-def test_constructor_rejects_bad_setup(ca, tmp_path, clock):
-    key = ed25519.Ed25519PrivateKey.generate()
-    _, csr = ca_mod.generate_csr("m", key)
-    member_cert = ca.issue_member_cert(csr, "m1", now=T0)
-    with pytest.raises(TSAError):  # certificado sem EKU timeStamping
-        TimestampAuthority(key, member_cert, tmp_path / "s.json", clock)
-    _, _, tsa_cert = _make_tsa(ca, tmp_path, clock, state="x.json")
-    with pytest.raises(TSAError):  # chave não corresponde ao certificado
-        TimestampAuthority(ed25519.Ed25519PrivateKey.generate(), tsa_cert, tmp_path / "s.json", clock)
-
-
-def test_load_from_pem_files(ca, tmp_path, clock):
-    key = ed25519.Ed25519PrivateKey.generate()
-    _, csr = ca_mod.generate_csr("tsa", key)
-    cert = ca.issue_tsa_cert(csr, "tsa", now=T0)
-    (tmp_path / "k.pem").write_bytes(key.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-        serialization.BestAvailableEncryption(b"pw")))
-    (tmp_path / "c.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    tsa = TimestampAuthority.load(tmp_path / "k.pem", tmp_path / "c.pem", tmp_path / "s.json", "pw", clock)
-    assert tsa_mod.verify_token(tsa.stamp(H), ca.cert, H, now=clock.t) == T0
+    # Certificado de servidor (sem EKU timeStamping)
+    _, csr = ca_mod.generate_csr("srv", tsa_key)
+    srv = ca.issue_server_cert(csr, "srv", dns_names=["srv"])
+    k, c = _write(tmp_path, tsa_key, srv, name="srv")
     with pytest.raises(TSAError):
-        TimestampAuthority.load(tmp_path / "k.pem", tmp_path / "c.pem", tmp_path / "s2.json", "errada", clock)
+        TimestampAuthority(k, c, tmp_path / "s2")
+
+    # Chave não RSA
+    eck, csr = ca_mod.generate_csr("tsa-ec")
+    cert = ca.issue_tsa_cert(csr, "tsa-ec")
+    k, c = _write(tmp_path, eck, cert, name="ec")
+    with pytest.raises(TSAError):
+        TimestampAuthority(k, c, tmp_path / "s3")
+
+    # Passphrase errada, vazia, binário que não é OpenSSL
+    k, c = _write(tmp_path, tsa_key, ca.issue_tsa_cert(ca_mod.generate_csr("t", tsa_key)[1], "t"),
+                  passphrase="certa", name="pw")
+    with pytest.raises(TSAError):
+        TimestampAuthority(k, c, tmp_path / "s4", passphrase="errada")
+    with pytest.raises(TSAError):
+        TimestampAuthority(k, c, tmp_path / "s4", passphrase="")
+    with pytest.raises(TSAError):
+        TimestampAuthority(k, c, tmp_path / "s4", passphrase="certa", openssl="/nao/existe")
 
 
-# --- Verificação: adulteração ---
+def test_weak_rsa_key_rejected(ca, tmp_path):
+    weak = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _, csr = ca_mod.generate_csr("tsa", weak)
+    k, c = _write(tmp_path, weak, ca.issue_tsa_cert(csr, "tsa"))
+    with pytest.raises(TSAError):
+        TimestampAuthority(k, c, tmp_path / "s")
 
-def test_wrong_imprint_rejected(tsa, ca, clock):
-    tok = tsa.stamp(H)
+
+# --- Rejeição de tokens ---
+
+def test_wrong_imprint_rejected(tsa, ca):
+    _, token = _stamp(tsa)
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tok, ca.cert, hashlib.sha256(b"outro").digest(), now=clock.t)
+        tsa_mod.verify_token(token, ca.cert, hashlib.sha256(b"outro").digest())
 
 
-@pytest.mark.parametrize("change", [
-    {"serial": 99}, {"gen_time_ms": 1}, {"nonce": b"x"}, {"hash_alg": "sha512"}, {"version": 2},
-])
-def test_tampered_fields_rejected(tsa, ca, clock, change):
-    tok = replace(tsa.stamp(H), **change)
+def test_wrong_nonce_and_policy_rejected(tsa, ca):
+    req, token = _stamp(tsa)
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tok, ca.cert, H, now=clock.t)
-
-
-def test_tampered_imprint_with_matching_request_rejected(tsa, ca, clock):
-    """Atacante troca o hash no token e pede verificação com o hash novo: a assinatura falha."""
-    other = hashlib.sha256(b"outro").digest()
-    tok = replace(tsa.stamp(H), imprint=other)
+        tsa_mod.verify_token(token, ca.cert, H, nonce=req.nonce + 1)
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tok, ca.cert, other, now=clock.t)
+        tsa_mod.verify_token(token, ca.cert, H, policy="1.2.3.4.2")
 
 
-def test_bad_signature_rejected(tsa, ca, clock):
-    tok = tsa.stamp(H)
-    sig = bytearray(tok.signature)
-    sig[0] ^= 1
+def test_bad_signature_rejected(tsa, ca):
+    _, token = _stamp(tsa)
+    bad = bytearray(token)
+    bad[-1] ^= 1  # último byte da assinatura RSA no SignerInfo
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(replace(tok, signature=bytes(sig)), ca.cert, H, now=clock.t)
+        tsa_mod.verify_token(bytes(bad), ca.cert, H)
 
 
-def test_nonce_checked_when_given(tsa, ca, clock):
-    tok = tsa.stamp(H, nonce=b"abc")
-    tsa_mod.verify_token(tok, ca.cert, H, nonce=b"abc", now=clock.t)
+def test_tampered_tstinfo_rejected(tsa, ca):
+    """Mudar o hash dentro do TSTInfo (e pedir esse hash) quebra a assinatura."""
+    _, token = _stamp(tsa)
+    forged_h = bytes([H[0] ^ 1]) + H[1:]
+    forged = token.replace(H, forged_h)
+    assert forged != token
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tok, ca.cert, H, nonce=b"xyz", now=clock.t)
+        tsa_mod.verify_token(forged, ca.cert, forged_h)
 
 
-def test_token_from_other_ca_rejected(tsa, tmp_path, clock):
-    other = CertificateAuthority.init(tmp_path / "other", PW, now=T0)
+def test_token_from_other_ca_rejected(tsa, tmp_path):
+    _, token = _stamp(tsa)
+    other = CertificateAuthority.init(tmp_path / "other", PW)
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tsa.stamp(H), other.cert, H, now=clock.t)
+        tsa_mod.verify_token(token, other.cert, H)
 
 
-def test_certificate_substitution_rejected(ca, tmp_path, clock):
-    """Trocar o certificado por outro TSA válido da mesma CA não pode passar."""
-    tsa_a, _, _ = _make_tsa(ca, tmp_path, clock, name="a", state="a.json")
-    _, _, cert_b = _make_tsa(ca, tmp_path, clock, name="b", state="b.json")
-    tok = replace(tsa_a.stamp(H), tsa_cert_der=cert_b.public_bytes(serialization.Encoding.DER))
+def test_token_from_tsa_of_other_ca_rejected(tsa, ca, tmp_path, tsa_key):
+    """Uma TSA válida mas certificada por outra CA não é aceite pela raiz da federação."""
+    other_ca = CertificateAuthority.init(tmp_path / "other", PW)
+    rogue = _make_tsa(other_ca, tmp_path, tsa_key, state="rogue")
+    _, token = _stamp(rogue)
+    assert tsa_mod.verify_token(token, other_ca.cert, H)
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tok, ca.cert, H, now=clock.t)
+        tsa_mod.verify_token(token, ca.cert, H)
 
 
-def test_forged_token_with_real_cert_but_other_key_rejected(tsa, ca, clock):
-    real = tsa.stamp(H)
-    attacker = ed25519.Ed25519PrivateKey.generate()
-    msg = tsa_mod._signed_message(1, "sha256", H, 7, real.gen_time_ms, b"", real.tsa_cert_der)
-    forged = replace(real, serial=7, signature=attacker.sign(msg))
+def test_future_token_rejected(tsa, ca):
+    _, token = _stamp(tsa)
+    gen = tsa_mod.parse_token(token).gen_time
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(forged, ca.cert, H, now=clock.t)
+        tsa_mod.verify_token(token, ca.cert, H, now=gen - timedelta(hours=1))
 
 
-def test_forged_token_with_selfsigned_cert_rejected(tsa, ca, clock, tmp_path):
-    rogue = CertificateAuthority.init(tmp_path / "rogue", PW, now=T0)
-    rogue_tsa, _, _ = _make_tsa(rogue, tmp_path, clock, state="r.json")
+def test_max_age(tsa, ca):
+    """Prazo de disputas: 30 dias pela hora do token."""
+    _, token = _stamp(tsa)
+    gen = tsa_mod.parse_token(token).gen_time
+    assert tsa_mod.verify_token(token, ca.cert, H, now=gen + timedelta(days=29),
+                                max_age=timedelta(days=30))
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(rogue_tsa.stamp(H), ca.cert, H, now=clock.t)
+        tsa_mod.verify_token(token, ca.cert, H, now=gen + timedelta(days=31),
+                             max_age=timedelta(days=30))
 
 
-def test_non_tsa_cert_cannot_sign_tokens(ca, clock):
-    """Um membro com certificado de login assina à mão um token: rejeitado por EKU."""
-    key = ed25519.Ed25519PrivateKey.generate()
-    _, csr = ca_mod.generate_csr("m", key)
-    cert = ca.issue_member_cert(csr, "m1", now=T0)
-    der = cert.public_bytes(serialization.Encoding.DER)
-    sig = key.sign(tsa_mod._signed_message(1, "sha256", H, 1, int(T0.timestamp() * 1000), b"", der))
-    tok = TimestampToken(1, int(T0.timestamp() * 1000), H, b"", der, sig)
+def test_rejection_response_raises():
+    rejection = tsa_mod._tlv(0x30, tsa_mod._tlv(0x30, tsa_mod._der_uint(2)))
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tok, ca.cert, H, now=clock.t)
+        tsa_mod.token_from_response(rejection)
 
 
-# --- Verificação: tempo ---
-
-def test_token_stays_valid_after_tsa_cert_expires(ca, tmp_path, clock):
-    tsa, _, cert = _make_tsa(ca, tmp_path, clock, days=2)
-    tok = tsa.stamp(H)
-    later = cert.not_valid_after_utc + timedelta(days=30)
-    assert tsa_mod.verify_token(tok, ca.cert, H, now=later) == T0
-
-
-def test_token_issued_outside_cert_validity_rejected(ca, tmp_path, clock):
-    tsa, key, cert = _make_tsa(ca, tmp_path, clock)
-    tok = tsa.stamp(H)
-    early = T0 - timedelta(days=10)
-    forged_ms = int(early.timestamp() * 1000)
-    msg = tsa_mod._signed_message(1, "sha256", H, 1, forged_ms, b"", tok.tsa_cert_der)
-    forged = replace(tok, gen_time_ms=forged_ms, signature=key.sign(msg))  # só possível com a chave real
+@pytest.mark.parametrize("bad", [b"", b"lixo", b"\x30\x00", b"\x30\x80\x00\x00", b"\x30\x05\x02\x01"])
+def test_malformed_tokens_rejected(bad, ca):
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(forged, ca.cert, H, now=T0)
-
-
-def test_future_token_rejected(tsa, ca, clock):
-    tok = tsa.stamp(H)
+        tsa_mod.parse_token(bad)
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tok, ca.cert, H, now=T0 - timedelta(hours=1))
-    tsa_mod.verify_token(tok, ca.cert, H, now=T0 - timedelta(minutes=1))  # dentro da tolerância
-
-
-def test_max_age(tsa, ca, clock):
-    tok = tsa.stamp(H)
-    now = T0 + timedelta(days=29)
-    tsa_mod.verify_token(tok, ca.cert, H, now=now, max_age=timedelta(days=30))
+        tsa_mod.verify_token(bad, ca.cert, H)
     with pytest.raises(TokenError):
-        tsa_mod.verify_token(tok, ca.cert, H, now=T0 + timedelta(days=31), max_age=timedelta(days=30))
+        tsa_mod.token_from_response(bad)
 
 
-# --- Serialização ---
-
-def test_serialization_roundtrip(tsa, ca, clock):
-    tok = tsa.stamp(H, nonce=b"n")
-    again = TimestampToken.from_bytes(tok.to_bytes())
-    assert again == tok
-    tsa_mod.verify_token(again, ca.cert, H, nonce=b"n", now=clock.t)
-
-
-@pytest.mark.parametrize("bad", [
-    b"", b"nao json", b"[]", b'{"serial": 1}', b'"x"',
-])
-def test_malformed_tokens_rejected(bad):
-    with pytest.raises(TokenError):
-        TimestampToken.from_bytes(bad)
-
-
-def test_malformed_field_types_rejected(tsa):
-    d = tsa.stamp(H).to_dict()
-    for field, value in [("serial", "1"), ("serial", -1), ("serial", True), ("imprint", "@@@"),
-                         ("imprint", 5), ("hash_alg", 3), ("gen_time_ms", 1.5)]:
-        with pytest.raises(TokenError):
-            TimestampToken.from_dict({**d, field: value})
+def test_openssl_cli_accepts_reply(tsa, ca, tmp_path):
+    """Interoperabilidade: o próprio openssl verifica a resposta contra o pedido (com nonce)."""
+    req = tsa_mod.create_request(H)
+    (tmp_path / "q.tsq").write_bytes(req.der)
+    (tmp_path / "r.tsr").write_bytes(tsa.stamp(req.der))
+    (tmp_path / "ca.pem").write_bytes(ca.cert.public_bytes(serialization.Encoding.PEM))
+    out = subprocess.run([tsa_mod.OPENSSL, "ts", "-verify", "-queryfile", str(tmp_path / "q.tsq"),
+                          "-in", str(tmp_path / "r.tsr"), "-CAfile", str(tmp_path / "ca.pem")],
+                         capture_output=True)
+    assert out.returncode == 0 and b"Verification: OK" in out.stdout
 
 
 # --- Serviço HTTP ---
 
-def test_service(tsa, ca, clock):
+def test_service(tsa, ca):
     client = TestClient(create_app(tsa))
     assert client.get("/health").json() == {"status": "ok"}
-    b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
 
-    r = client.post("/v1/timestamp", json={"imprint": b64(H), "nonce": b64(b"n1")})
-    assert r.status_code == 200
-    tok = TimestampToken.from_dict(r.json())
-    assert tsa_mod.verify_token(tok, ca.cert, H, nonce=b"n1", now=clock.t) == T0
+    req = tsa_mod.create_request(H)
+    r = client.post("/v1/timestamp", content=req.der,
+                    headers={"Content-Type": "application/timestamp-query"})
+    assert r.status_code == 200 and r.headers["content-type"] == "application/timestamp-reply"
+    token = tsa_mod.token_from_response(r.content)
+    assert tsa_mod.verify_token(token, ca.cert, H, nonce=req.nonce).serial == 1
 
-    assert client.post("/v1/timestamp", json={"imprint": "@@@"}).status_code == 400
-    assert client.post("/v1/timestamp", json={"imprint": b64(b"curto")}).status_code == 400
-    assert client.post("/v1/timestamp", json={"imprint": b64(H), "nonce": b64(b"x" * 65)}).status_code == 400
-    assert client.post("/v1/timestamp", json={}).status_code == 422
-    assert client.get("/docs").status_code == 404
+    assert client.post("/v1/timestamp", content=req.der,
+                       headers={"Content-Type": "application/json"}).status_code == 415
+    assert client.post("/v1/timestamp", content=b"lixo",
+                       headers={"Content-Type": "application/timestamp-query"}).status_code == 400
+    assert client.post("/v1/timestamp", content=b"x" * 5000,
+                       headers={"Content-Type": "application/timestamp-query"}).status_code == 413
+

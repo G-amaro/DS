@@ -1,23 +1,37 @@
 erDiagram
     MEMBER ||--o{ LOGIN_CERT : "tem"
+    LOGIN_CERT |o--o| BLACKLIST_ENTRY : "pode estar na"
+    BLACKLIST_ENTRY }o--o{ CRL : "listada em"
     MEMBER |o--o| REVOCATION : "pode ter"
-    MEMBER ||--o{ EPOCH_KEY_ENVELOPE : "recebe"
-    MEMBER ||..o{ VAULT : "so o Arbiter liga"
-    EPOCH ||--o{ EPOCH_KEY_ENVELOPE : "distribui"
+    DISPUTE |o--o| REVOCATION : "pode originar"
+
+    MEMBER ||--o{ CREDENTIAL_ISSUED : "recebe"
+    EPOCH ||--o{ CREDENTIAL_ISSUED : "no lote"
+    MEMBER ||..o{ CREDENTIAL : "so o cofre liga, em duas camadas"
     EPOCH ||--o{ CREDENTIAL : "valida"
     CREDENTIAL ||--|| VAULT : "contem"
+    VAULT_KEY_GENERATION ||--o{ VAULT : "cifra"
+
+    VERSION ||--o{ DIRECTORY_ENTRY : "lista"
+    MEMBER ||--o{ DIRECTORY_ENTRY : "consta de"
+    VERSION ||--o{ REPORT : "admite"
+    VERSION ||--o{ CORROBORATION : "admite"
+
     CREDENTIAL ||--o{ REPORT : "assina"
     CREDENTIAL ||--o{ CORROBORATION : "assina"
     REPORT ||--o{ CORROBORATION : "recebe"
     TIMESTAMP_TOKEN |o--|| REPORT : "carimba"
     TIMESTAMP_TOKEN |o--|| CORROBORATION : "carimba"
+
     REPORT ||--o{ DISPUTE : "alvo de"
+    MEMBER ||--o{ DISPUTE : "abre"
     DISPUTE ||--o| VERDICT : "resulta em"
 
     MEMBER {
         string member_id PK
         string name
         bytes login_pubkey
+        bytes enc_pubkey "RSA-3072, decifra as chaves de conteudo"
         string status "active ou revoked"
     }
     LOGIN_CERT {
@@ -25,55 +39,94 @@ erDiagram
         string member_id FK
         datetime not_after
     }
-    REVOCATION {
-        string member_id PK
+    BLACKLIST_ENTRY {
+        string serial PK, FK
         datetime revoked_at
         string reason
     }
+    CRL {
+        int crl_number PK
+        datetime issued_at
+        datetime next_update
+        bytes ca_signature
+    }
+    REVOCATION {
+        string member_id PK, FK
+        datetime revoked_at
+        string cause "disputa ou saida ou chave comprometida"
+    }
     EPOCH {
         int epoch_id PK
-        datetime starts_at
+        datetime starts_at "00:00 ou 12:00 UTC"
         datetime ends_at
     }
-    EPOCH_KEY_ENVELOPE {
-        int epoch_id FK
-        string member_id FK
-        bytes wrapped_key "K_ep cifrada para o membro, vai no topico control"
+    CREDENTIAL_ISSUED {
+        string member_id PK, FK
+        int epoch_id PK, FK
     }
     CREDENTIAL {
-        string credential_id PK
         int epoch_id FK
-        bytes pk_ep "chave publica efemera"
+        bytes pk_E "chave publica da epoca"
+        string vault_id FK
         bytes coordinator_signature
     }
     VAULT {
         string vault_id PK
-        bytes ciphertext "id do membro, pk_ep e epoca, cifrado para o Arbiter"
+        int generation_id FK
+        bytes ciphertext "interior para o Arbiter, exterior para o Coordinator"
+    }
+    VAULT_KEY_GENERATION {
+        int generation_id PK
+        datetime valid_from
+        datetime destroy_after "30 dias depois da ultima epoca coberta"
+    }
+    VERSION {
+        int version_v PK
+        int epoch_id FK
+        string cause "epoca ou revogacao"
+        bytes k_adm "segredo, nunca publicado em claro"
+        bytes directory_signature
+    }
+    DIRECTORY_ENTRY {
+        int version_v PK, FK
+        string member_id PK, FK
+        bytes key_id "hash da chave publica de cifra"
     }
     REPORT {
-        uuid report_id PK
-        string credential_id FK
+        string rid PK "SHA-256 do report_id"
         int epoch_id FK
-        bytes ciphertext "JSON cifrado com K_ep"
-        bytes signature "assinatura com sk_ep"
+        int version_v FK
+        bytes pk_E
+        bytes ciphertext "JSON cifrado com K_c"
+        bytes recipient_list "K_c cifrada por destinatario"
+        bytes signature "assinatura com sk_E"
+        bytes admission_hmac
+        string token_id FK
     }
     CORROBORATION {
         string corroboration_id PK
-        uuid report_id FK
-        string credential_id FK
+        string rid FK
+        int version_v FK
+        bytes pk_E "unica por rid"
         bytes ciphertext
-        bytes signature "unico por report_id e pk_ep"
+        bytes recipient_list
+        bytes signature
+        string token_id FK
     }
     TIMESTAMP_TOKEN {
         string token_id PK
         bytes digest
         datetime time
+        int serial
         bytes tsa_signature
     }
     DISPUTE {
         string dispute_id PK
-        uuid report_id FK
-        datetime opened_at
+        string rid FK
+        string opened_by FK
+        datetime opened_at "ate 30 dias apos o token do relatorio"
+        string status "aberta, procedente ou improcedente"
+        bytes envelope_copy "guardada pelo Arbiter ao abrir"
     }
     VERDICT {
         string verdict_id PK

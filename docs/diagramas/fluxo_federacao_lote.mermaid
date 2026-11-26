@@ -16,7 +16,7 @@ sequenceDiagram
     C-->>M: Código + certificado raiz da CA + impressão digital + chaves públicas do Coordinator e do Arbiter (fora de banda)
 
     Note over M,A: 1. Inscrição do membro
-    M->>M: Gera sk_login (Ed25519), sk_enc (X25519) e a semente dos pseudónimos
+    M->>M: Gera sk_login (Ed25519), sk_enc (RSA-3072, só cifra) e a semente dos pseudónimos
     M->>M: Cria o CSR com a chave pública de login
     M->>C: Código + CSR + chave pública de cifra assinada com sk_login (TLS de servidor)
     C->>C: Valida o código (uso único, validade curta) e as provas de posse
@@ -31,13 +31,13 @@ sequenceDiagram
     C->>C: Verifica que o certificado não está na CRL, o horizonte e que não há credencial emitida para (membro, E)
     C-->>M: Desafio aleatório (um só para o lote)
     M->>C: Prova de posse = Assina(sk_E, E + desafio) para cada época
-    C->>C: Cria o cofre em duas camadas com as chaves de cofre do mês: interior ECIES(chave do Arbiter, member_id + pk_E + E) e exterior ECIES(chave do Coordinator, interior), com o identificador da geração das chaves
+    C->>C: Cria o cofre em duas camadas com as chaves de cofre do mês: interior = AES-GCM(member_id + pk_E + E) com a chave AES cifrada por RSA-OAEP para o Arbiter, exterior = o mesmo esquema sobre o interior para o Coordinator, com o identificador da geração das chaves
     C->>C: Assina a credencial (hash do cofre) e regista só (membro, E) como emitido, nunca a pk_E
     C-->>M: Lote de credenciais com cofres
 
     Note over M,K: 3. Versão V: diretório de membros e K_adm (a cada época e a cada revogação)
     C->>C: Gera K_adm aleatória (não decifra nada) e o diretório com as chaves públicas de cifra dos membros ativos
-    C->>K: control: diretório V assinado + K_adm cifrada (ECIES) para cada membro ativo
+    C->>K: control: diretório V assinado + K_adm cifrada (RSA-OAEP, label FED-KADM-v1 + V) para cada membro ativo
     C->>G: Entrega a K_adm da versão V (TLS, assinado)
     M->>K: Lê control (mTLS)
     M->>M: Verifica a assinatura do diretório e guarda K_adm
@@ -51,7 +51,7 @@ sequenceDiagram
     Note over M,G: 4. Publicar um relatório (via Tor, sem certificado de login)
     M->>M: Gera o JSON com report_id aleatório e a chave de conteúdo K_c aleatória
     M->>M: Cifra o JSON com K_c (AES-GCM, dados associados = época + rid + versão V)
-    M->>M: Cifra K_c (ECIES) para cada membro do diretório V e junta a lista ao envelope
+    M->>M: Cifra K_c (RSA-OAEP, label FED-KC-v1 + rid) para cada membro do diretório V e junta a lista ao envelope
     M->>M: Calcula rid = SHA-256(report_id) e assina com sk_E o hash do ciphertext e da lista de chaves
     M->>M: Calcula o HMAC de admissão com K_adm
     M->>G: Envelope (ciphertext + lista de chaves cifradas) + E + V + rid + assinatura + HMAC + credencial
@@ -123,7 +123,7 @@ sequenceDiagram
     C->>K: Instala a CRL no broker (não é publicada aos membros)
     C->>C: Passa a recusar pedidos de lote e login ao certificado revogado
     C->>C: Gera a versão V+1: retira o membro do diretório e gera nova K_adm
-    C->>K: control: diretório V+1 assinado + K_adm cifrada (ECIES) para cada membro ativo
+    C->>K: control: diretório V+1 assinado + K_adm cifrada (RSA-OAEP, label FED-KADM-v1 + V) para cada membro ativo
     C->>G: Entrega a K_adm da versão V+1 (assinado)
     M->>K: Membros ativos leem control, sem ligar ao Coordinator
     G->>G: Passa a exigir a versão V+1 (a anterior deixa de valer, sem margem)

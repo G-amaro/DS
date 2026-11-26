@@ -3,9 +3,11 @@
 Implementa:
 - Assinaturas Ed25519 com separação de domínio e codificação segura de comprimentos.
 - Cifra simétrica autenticada AES-256-GCM com nonce aleatório de 12 bytes e associated_data obrigatório.
-- Cifra assimétrica ECIES (X25519 efémero + HKDF-SHA256 + AES-256-GCM) com `info` e
-  associated_data obrigatórios, para que um criptograma não possa ser reutilizado noutro contexto.
-- Entrega de K_c e de K_adm, cofre em duas camadas (Arbiter dentro, Coordinator fora).
+- Cifra assimétrica RSA-OAEP (RSA-3072, MGF1-SHA256) com label obrigatório, um por utilização,
+  para que um criptograma não possa ser reutilizado noutro contexto.
+- Cifra híbrida (AES-256-GCM + chave AES em RSA-OAEP) para o cofre, que não cabe num bloco RSA.
+- Entrega de K_c e de K_adm (RSA-OAEP direto: a chave de 32 B cabe num bloco),
+  cofre em duas camadas (Arbiter dentro, Coordinator fora).
 - Cadeia de pseudónimos por época (HKDF), HMAC de admissão (K_adm) e cálculo de épocas de 12 h.
 - Gestão e serialização de chaves usando a biblioteca cryptography (>= 42).
 """
@@ -21,7 +23,7 @@ from typing import Tuple
 
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -36,14 +38,18 @@ DOMAIN_DIRECTORY = b"FED-DIR-v1"
 DOMAIN_ADMISSION = b"FED-ADM-v1"
 
 # Rótulos HKDF (separação de utilização) para a cadeia de pseudónimos
-INFO_CHAIN_KEY = b"FED-CHAIN-key-v1"
-INFO_CHAIN_NEXT = b"FED-CHAIN-next-v1"
+HKDF_CHAIN_KEY = b"FED-CHAIN-key-v1"
+HKDF_CHAIN_NEXT = b"FED-CHAIN-next-v1"
 
-# Rótulos HKDF do ECIES, um por utilização
-INFO_KC = b"FED-KC-v1"                   # K_c para cada membro do diretório
-INFO_DIRKEY = b"FED-DIRKEY-v1"           # K_adm para cada membro ativo
-INFO_VAULT_INNER = b"FED-VAULT-IN-v1"    # Cofre interior (chave do Arbiter)
-INFO_VAULT_OUTER = b"FED-VAULT-OUT-v1"   # Cofre exterior (chave de cofre do Coordinator)
+# Labels do RSA-OAEP, um por utilização (obrigatórios)
+LABEL_KC = b"FED-KC-v1"                   # K_c para cada membro do diretório (+ rid)
+LABEL_KADM = b"FED-KADM-v1"               # K_adm para cada membro ativo (+ V)
+LABEL_VAULT_INNER = b"FED-VAULT-IN-v1"    # Cofre interior (chave do Arbiter)
+LABEL_VAULT_OUTER = b"FED-VAULT-OUT-v1"   # Cofre exterior (chave de cofre do Coordinator)
+
+# Chaves de cifra RSA (membros, Arbiter, Coordinator)
+RSA_KEY_BITS = 3072
+RSA_PUBLIC_EXPONENT = 65537
 
 # Duração da época E (12 h, fronteiras às 00:00 e 12:00 UTC)
 EPOCH_SECONDS = 12 * 3600
@@ -72,9 +78,11 @@ def generate_ed25519_keypair() -> Tuple[ed25519.Ed25519PrivateKey, ed25519.Ed255
     return private_key, private_key.public_key()
 
 
-def generate_x25519_keypair() -> Tuple[x25519.X25519PrivateKey, x25519.X25519PublicKey]:
-    """Gera um par de chaves X25519 para troca de chaves/cifra."""
-    private_key = x25519.X25519PrivateKey.generate()
+def generate_rsa_keypair(bits: int = RSA_KEY_BITS) -> Tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey]:
+    """Gera um par RSA (por omissão 3072 bits, e = 65537) usado só para cifra."""
+    if bits < RSA_KEY_BITS:
+        raise ValueError(f"Chaves RSA de cifra têm de ter pelo menos {RSA_KEY_BITS} bits.")
+    private_key = rsa.generate_private_key(public_exponent=RSA_PUBLIC_EXPONENT, key_size=bits)
     return private_key, private_key.public_key()
 
 
@@ -145,10 +153,19 @@ def ed25519_public_from_raw(raw_bytes: bytes) -> ed25519.Ed25519PublicKey:
     return ed25519.Ed25519PublicKey.from_public_bytes(raw_bytes)
 
 
-# --- Serialização de Chaves X25519 ---
+# --- Serialização de Chaves RSA (cifra) ---
 
-def x25519_private_to_pem(private_key: x25519.X25519PrivateKey, passphrase: str | None = None) -> bytes:
-    """Serializa chave privada X25519 para PEM (cifrada se houver passphrase)."""
+def _check_rsa_key(key) -> None:
+    """Recusa chaves que não sejam RSA ou que tenham menos de RSA_KEY_BITS bits."""
+    if not isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)):
+        raise ValueError("A chave fornecida não é RSA.")
+    if key.key_size < RSA_KEY_BITS:
+        raise ValueError(f"Chave RSA com menos de {RSA_KEY_BITS} bits.")
+
+
+def rsa_private_to_pem(private_key: rsa.RSAPrivateKey, passphrase: str | None = None) -> bytes:
+    """Serializa chave privada RSA para PEM PKCS#8 (cifrada se houver passphrase)."""
+    _check_rsa_key(private_key)
     return private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -156,41 +173,52 @@ def x25519_private_to_pem(private_key: x25519.X25519PrivateKey, passphrase: str 
     )
 
 
-def x25519_private_from_pem(pem_bytes: bytes, passphrase: str | None = None) -> x25519.X25519PrivateKey:
-    """Carrega chave privada X25519 a partir de PEM."""
+def rsa_private_from_pem(pem_bytes: bytes, passphrase: str | None = None) -> rsa.RSAPrivateKey:
+    """Carrega chave privada RSA a partir de PEM (recusa outro tipo ou < 3072 bits)."""
     key = serialization.load_pem_private_key(pem_bytes, password=_password_bytes(passphrase))
-    if not isinstance(key, x25519.X25519PrivateKey):
-        raise ValueError("A chave PEM fornecida não é X25519.")
+    if not isinstance(key, rsa.RSAPrivateKey):
+        raise ValueError("A chave PEM fornecida não é RSA.")
+    _check_rsa_key(key)
     return key
 
 
-def x25519_public_to_pem(public_key: x25519.X25519PublicKey) -> bytes:
-    """Serializa chave pública X25519 para PEM."""
+def rsa_public_to_pem(public_key: rsa.RSAPublicKey) -> bytes:
+    """Serializa chave pública RSA para PEM (SubjectPublicKeyInfo)."""
+    _check_rsa_key(public_key)
     return public_key.public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
 
-def x25519_public_from_pem(pem_bytes: bytes) -> x25519.X25519PublicKey:
-    """Carrega chave pública X25519 a partir de PEM."""
+def rsa_public_from_pem(pem_bytes: bytes) -> rsa.RSAPublicKey:
+    """Carrega chave pública RSA a partir de PEM."""
     key = serialization.load_pem_public_key(pem_bytes)
-    if not isinstance(key, x25519.X25519PublicKey):
-        raise ValueError("A chave PEM fornecida não é pública X25519.")
+    if not isinstance(key, rsa.RSAPublicKey):
+        raise ValueError("A chave PEM fornecida não é pública RSA.")
+    _check_rsa_key(key)
     return key
 
 
-def x25519_public_to_raw(public_key: x25519.X25519PublicKey) -> bytes:
-    """Devolve os 32 bytes brutos da chave pública X25519."""
+def rsa_public_to_der(public_key: rsa.RSAPublicKey) -> bytes:
+    """Codificação canónica da chave pública RSA (DER SubjectPublicKeyInfo).
+
+    É esta a forma usada no diretório e no key_id da lista de chaves.
+    """
+    _check_rsa_key(public_key)
     return public_key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
 
-def x25519_public_from_raw(raw_bytes: bytes) -> x25519.X25519PublicKey:
-    """Reconstrói chave pública X25519 a partir dos 32 bytes brutos."""
-    return x25519.X25519PublicKey.from_public_bytes(raw_bytes)
+def rsa_public_from_der(der_bytes: bytes) -> rsa.RSAPublicKey:
+    """Reconstrói uma chave pública RSA a partir do DER SubjectPublicKeyInfo."""
+    key = serialization.load_der_public_key(der_bytes)
+    if not isinstance(key, rsa.RSAPublicKey):
+        raise ValueError("A chave DER fornecida não é pública RSA.")
+    _check_rsa_key(key)
+    return key
 
 
 # --- Cifra Simétrica Autenticada (AES-256-GCM) ---
@@ -228,82 +256,69 @@ def aes_gcm_decrypt(key: bytes, payload: bytes, associated_data: bytes) -> bytes
         raise ValueError("Falha na autenticação do ciphertext AES-GCM (tag inválida ou adulterada).")
 
 
-# --- Cifra Híbrida / ECIES (X25519 + HKDF-SHA256 + AES-256-GCM) ---
+# --- RSA-OAEP (RSA-3072, OAEP com SHA-256 e MGF1-SHA256) ---
 
-def _check_ecies_context(info: bytes, associated_data: bytes) -> None:
-    if not info:
-        raise ValueError("ECIES exige um `info` não vazio (uma constante INFO_* por utilização).")
-    if associated_data is None:
-        raise ValueError("ECIES exige associated_data.")
-
-
-def _ecies_key(shared_secret: bytes, eph_pub_bytes: bytes, recipient_pub_bytes: bytes, info: bytes) -> bytes:
-    """Deriva a chave AES do ECIES. O salt liga a chave às duas chaves públicas envolvidas."""
-    return HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=eph_pub_bytes + recipient_pub_bytes,
-        info=info,
-    ).derive(shared_secret)
+def _oaep(label: bytes) -> padding.OAEP:
+    if not label:
+        raise ValueError("RSA-OAEP exige um label não vazio (um LABEL_* por utilização).")
+    return padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(), label=label)
 
 
-def ecies_encrypt(
-    recipient_public_key: x25519.X25519PublicKey,
-    plaintext: bytes,
-    *,
-    info: bytes,
-    associated_data: bytes,
-) -> bytes:
-    """Cifra para uma chave pública X25519 destinatária usando ECIES efémero.
+def rsa_oaep_encrypt(recipient_public_key: rsa.RSAPublicKey, plaintext: bytes, *, label: bytes) -> bytes:
+    """Cifra até 318 bytes para uma chave pública RSA-3072.
 
-    `info` separa utilizações (HKDF) e `associated_data` é autenticado pelo AES-GCM;
-    ambos são obrigatórios, de modo que um criptograma não possa ser reutilizado noutro contexto.
-
-    Formato resultante:
-    ephemeral_public_key (32 bytes) + nonce (12 bytes) + ciphertext_and_tag.
+    O `label` é obrigatório e identifica a utilização: um criptograma feito para um uso
+    (ex.: K_c de um rid) não decifra noutro (ex.: K_adm de uma versão).
     """
-    _check_ecies_context(info, associated_data)
-    ephemeral_private, ephemeral_public = generate_x25519_keypair()
-    shared_secret = ephemeral_private.exchange(recipient_public_key)
-
-    eph_pub_bytes = x25519_public_to_raw(ephemeral_public)
-    recipient_pub_bytes = x25519_public_to_raw(recipient_public_key)
-    derived_aes_key = _ecies_key(shared_secret, eph_pub_bytes, recipient_pub_bytes, info)
-
-    nonce = os.urandom(12)
-    aesgcm = AESGCM(derived_aes_key)
-    ciphertext_and_tag = aesgcm.encrypt(nonce, plaintext, associated_data)
-
-    return eph_pub_bytes + nonce + ciphertext_and_tag
+    oaep = _oaep(label)
+    _check_rsa_key(recipient_public_key)
+    return recipient_public_key.encrypt(plaintext, oaep)
 
 
-def ecies_decrypt(
-    recipient_private_key: x25519.X25519PrivateKey,
-    payload: bytes,
-    *,
-    info: bytes,
-    associated_data: bytes,
-) -> bytes:
-    """Decifra payload ECIES usando a chave privada X25519 do destinatário."""
-    _check_ecies_context(info, associated_data)
-    if len(payload) < 32 + 12 + 16:
-        raise ValueError("Payload ECIES demasiado curto.")
-
-    eph_pub_bytes = payload[:32]
-    nonce = payload[32:44]
-    ciphertext_and_tag = payload[44:]
-
-    ephemeral_public = x25519_public_from_raw(eph_pub_bytes)
-    shared_secret = recipient_private_key.exchange(ephemeral_public)
-
-    recipient_pub_bytes = x25519_public_to_raw(recipient_private_key.public_key())
-    derived_aes_key = _ecies_key(shared_secret, eph_pub_bytes, recipient_pub_bytes, info)
-
-    aesgcm = AESGCM(derived_aes_key)
+def rsa_oaep_decrypt(recipient_private_key: rsa.RSAPrivateKey, ciphertext: bytes, *, label: bytes) -> bytes:
+    """Decifra um criptograma RSA-OAEP. Falha (ValueError) com chave, label ou dados errados."""
+    oaep = _oaep(label)
+    _check_rsa_key(recipient_private_key)
+    if len(ciphertext) != recipient_private_key.key_size // 8:
+        raise ValueError("Criptograma RSA-OAEP com tamanho inválido.")
     try:
-        return aesgcm.decrypt(nonce, ciphertext_and_tag, associated_data)
-    except InvalidTag:
-        raise ValueError("Falha na decifração ECIES (dados corrompidos, chave, info ou contexto incorretos).")
+        return recipient_private_key.decrypt(ciphertext, oaep)
+    except ValueError:
+        raise ValueError("Falha na decifração RSA-OAEP (chave, label ou dados incorretos).") from None
+
+
+# --- Cifra híbrida (AES-256-GCM + chave AES em RSA-OAEP) ---
+
+def hybrid_encrypt(recipient_public_key: rsa.RSAPublicKey, plaintext: bytes, *,
+                   label: bytes, associated_data: bytes) -> bytes:
+    """Cifra dados de qualquer tamanho para uma chave RSA.
+
+    Gera uma chave AES-256 nova, cifra os dados com AES-GCM (com `associated_data`) e cifra
+    a chave AES com RSA-OAEP (com `label`). Ambos os contextos são obrigatórios.
+
+    Formato: comprimento (4 B) + chave AES cifrada (384 B para RSA-3072) + nonce + ciphertext + tag.
+    """
+    if associated_data is None:
+        raise ValueError("A cifra híbrida exige associated_data.")
+    key = generate_symmetric_key()
+    wrapped = rsa_oaep_encrypt(recipient_public_key, key, label=label)
+    return _pack_with_length(wrapped) + aes_gcm_encrypt(key, plaintext, associated_data)
+
+
+def hybrid_decrypt(recipient_private_key: rsa.RSAPrivateKey, payload: bytes, *,
+                   label: bytes, associated_data: bytes) -> bytes:
+    """Inverso de hybrid_encrypt."""
+    if associated_data is None:
+        raise ValueError("A cifra híbrida exige associated_data.")
+    if len(payload) < 4:
+        raise ValueError("Criptograma híbrido demasiado curto.")
+    (wrapped_len,) = struct.unpack(">I", payload[:4])
+    if len(payload) < 4 + wrapped_len:
+        raise ValueError("Criptograma híbrido truncado.")
+    wrapped = payload[4:4 + wrapped_len]
+    key = rsa_oaep_decrypt(recipient_private_key, wrapped, label=label)
+    return aes_gcm_decrypt(key, payload[4 + wrapped_len:], associated_data)
 
 
 # --- Prova de Posse (Proof-of-Possession) do Membro ---
@@ -409,49 +424,52 @@ def _vault_outer_aad(epoch_id: int, vault_key_gen: int) -> bytes:
     return _u32(epoch_id) + _u32(vault_key_gen)
 
 
-def seal_vault(arbiter_pk: x25519.X25519PublicKey, coord_vault_pk: x25519.X25519PublicKey,
+def seal_vault(arbiter_pk: rsa.RSAPublicKey, coord_vault_pk: rsa.RSAPublicKey,
                vault_key_gen: int, member_id: str, pk_E_bytes: bytes, epoch_id: int) -> bytes:
     """Cria o cofre em duas camadas (feito pelo Coordinator na emissão da credencial).
 
-    interior = ECIES(chave do Arbiter, member_id + pk_E + E)
-    exterior = ECIES(chave de cofre do Coordinator da geração `vault_key_gen`, interior)
+    Cada camada é uma cifra híbrida (AES-256-GCM + chave AES em RSA-OAEP):
+    interior = híbrida(chave de cofre do Arbiter, member_id + pk_E + E),
+               label FED-VAULT-IN-v1, dados associados E + pk_E
+    exterior = híbrida(chave de cofre do Coordinator da geração `vault_key_gen`, interior),
+               label FED-VAULT-OUT-v1, dados associados E + geração (sem pk_E)
     """
-    inner = ecies_encrypt(
+    inner = hybrid_encrypt(
         arbiter_pk,
         build_vault_payload(member_id, pk_E_bytes, epoch_id),
-        info=INFO_VAULT_INNER,
+        label=LABEL_VAULT_INNER,
         associated_data=_vault_inner_aad(epoch_id, pk_E_bytes),
     )
-    return ecies_encrypt(
+    return hybrid_encrypt(
         coord_vault_pk,
         inner,
-        info=INFO_VAULT_OUTER,
+        label=LABEL_VAULT_OUTER,
         associated_data=_vault_outer_aad(epoch_id, vault_key_gen),
     )
 
 
-def open_vault_outer(coord_vault_sk: x25519.X25519PrivateKey, vault: bytes,
+def open_vault_outer(coord_vault_sk: rsa.RSAPrivateKey, vault: bytes,
                      epoch_id: int, vault_key_gen: int) -> bytes:
     """O Coordinator remove a camada exterior (só a pedido do Arbiter, numa disputa procedente)."""
-    return ecies_decrypt(
+    return hybrid_decrypt(
         coord_vault_sk,
         vault,
-        info=INFO_VAULT_OUTER,
+        label=LABEL_VAULT_OUTER,
         associated_data=_vault_outer_aad(epoch_id, vault_key_gen),
     )
 
 
-def open_vault_inner(arbiter_sk: x25519.X25519PrivateKey, inner: bytes,
+def open_vault_inner(arbiter_sk: rsa.RSAPrivateKey, inner: bytes,
                      epoch_id: int, pk_E_bytes: bytes) -> str:
     """O Arbiter abre a camada interior e devolve o member_id.
 
     Confirma que a pk_E e a época dentro do cofre coincidem com as da credencial;
     caso contrário lança ValueError.
     """
-    plaintext = ecies_decrypt(
+    plaintext = hybrid_decrypt(
         arbiter_sk,
         inner,
-        info=INFO_VAULT_INNER,
+        label=LABEL_VAULT_INNER,
         associated_data=_vault_inner_aad(epoch_id, pk_E_bytes),
     )
     member_id, got_pk, got_epoch = parse_vault_payload(plaintext)
@@ -467,9 +485,10 @@ def compute_rid(report_id: str) -> bytes:
     return hashlib.sha256(report_id.encode("utf-8")).digest()
 
 
-def recipient_key_id(recipient_pub_raw: bytes) -> bytes:
-    """Identificador de um destinatário na lista de chaves: SHA-256 da chave pública de cifra."""
-    return hashlib.sha256(recipient_pub_raw).digest()
+def recipient_key_id(recipient_pub_der: bytes) -> bytes:
+    """Identificador de um destinatário na lista de chaves: SHA-256 da chave pública de cifra
+    (DER SubjectPublicKeyInfo, ver rsa_public_to_der)."""
+    return hashlib.sha256(recipient_pub_der).digest()
 
 
 def serialize_key_list(entries: list[tuple[bytes, bytes]]) -> bytes:
@@ -515,43 +534,66 @@ def envelope_digest(ciphertext: bytes, key_list: bytes) -> bytes:
 
 
 def report_aad(epoch_id: int, rid: bytes, version: int) -> bytes:
-    """Dados associados do conteúdo (AES-GCM) e da entrega de K_c: época, rid e versão V."""
+    """Dados associados do conteúdo (AES-GCM): época, rid e versão V."""
     return _u32(epoch_id) + _pack_with_length(rid) + _u32(version)
 
 
 # --- Entrega de K_c (uma entrada por membro do diretório) ---
 
-def wrap_content_key(recipient_pub: x25519.X25519PublicKey, k_c: bytes,
+def _kc_label(rid: bytes) -> bytes:
+    """Label OAEP da K_c: FED-KC-v1 + rid (com prefixo de comprimento)."""
+    return LABEL_KC + _pack_with_length(rid)
+
+
+def _kadm_label(version: int) -> bytes:
+    """Label OAEP da K_adm: FED-KADM-v1 + V."""
+    return LABEL_KADM + _u32(version)
+
+
+def wrap_content_key(recipient_pub: rsa.RSAPublicKey, k_c: bytes,
                      epoch_id: int, rid: bytes, version: int) -> bytes:
-    """Cifra K_c para um membro (ECIES, info FED-KC-v1, ligada a E, rid e V)."""
-    return ecies_encrypt(recipient_pub, k_c, info=INFO_KC,
-                         associated_data=report_aad(epoch_id, rid, version))
+    """Cifra K_c para um membro (RSA-OAEP, label FED-KC-v1 + rid).
+
+    O label só liga a K_c ao rid. A época e a versão (aceites aqui para manter a interface)
+    ficam ligadas pela assinatura sk_E, que cobre E, V, rid e o SHA-256 da lista de chaves,
+    e pelos dados associados do conteúdo (report_aad).
+    """
+    del epoch_id, version  # ligados pela assinatura e pelo report_aad, não pelo label
+    if len(k_c) != 32:
+        raise ValueError("A K_c tem de ter 32 bytes.")
+    return rsa_oaep_encrypt(recipient_pub, k_c, label=_kc_label(rid))
 
 
-def unwrap_content_key(recipient_sk: x25519.X25519PrivateKey, wrapped: bytes,
+def unwrap_content_key(recipient_sk: rsa.RSAPrivateKey, wrapped: bytes,
                        epoch_id: int, rid: bytes, version: int) -> bytes:
-    """Decifra a K_c destinada a este membro."""
-    return ecies_decrypt(recipient_sk, wrapped, info=INFO_KC,
-                         associated_data=report_aad(epoch_id, rid, version))
+    """Decifra a K_c destinada a este membro (ver wrap_content_key)."""
+    del epoch_id, version
+    k_c = rsa_oaep_decrypt(recipient_sk, wrapped, label=_kc_label(rid))
+    if len(k_c) != 32:
+        raise ValueError("K_c decifrada com tamanho inválido.")
+    return k_c
 
 
-def build_key_list(member_pubs_raw: list[bytes], k_c: bytes,
+def build_key_list(member_pubs_der: list[bytes], k_c: bytes,
                    epoch_id: int, rid: bytes, version: int) -> bytes:
-    """Constrói a lista de chaves serializada para todos os membros do diretório V."""
+    """Constrói a lista de chaves serializada para todos os membros do diretório V.
+
+    `member_pubs_der` são as chaves públicas RSA do diretório em DER (rsa_public_to_der).
+    """
     entries = []
-    for raw in member_pubs_raw:
-        wrapped = wrap_content_key(x25519_public_from_raw(raw), k_c, epoch_id, rid, version)
-        entries.append((recipient_key_id(raw), wrapped))
+    for der in member_pubs_der:
+        wrapped = wrap_content_key(rsa_public_from_der(der), k_c, epoch_id, rid, version)
+        entries.append((recipient_key_id(der), wrapped))
     return serialize_key_list(entries)
 
 
-def unwrap_from_key_list(recipient_sk: x25519.X25519PrivateKey, key_list: bytes,
+def unwrap_from_key_list(recipient_sk: rsa.RSAPrivateKey, key_list: bytes,
                          epoch_id: int, rid: bytes, version: int) -> bytes:
     """Procura a entrada deste membro na lista de chaves e devolve a K_c.
 
     Lança ValueError se o membro não constar da lista ou se a entrada não decifrar.
     """
-    my_id = recipient_key_id(x25519_public_to_raw(recipient_sk.public_key()))
+    my_id = recipient_key_id(rsa_public_to_der(recipient_sk.public_key()))
     for key_id, wrapped in parse_key_list(key_list):
         if hmac.compare_digest(key_id, my_id):
             return unwrap_content_key(recipient_sk, wrapped, epoch_id, rid, version)
@@ -560,14 +602,19 @@ def unwrap_from_key_list(recipient_sk: x25519.X25519PrivateKey, key_list: bytes,
 
 # --- Entrega de K_adm (versão V) ---
 
-def wrap_k_adm(member_pub: x25519.X25519PublicKey, k_adm: bytes, version: int) -> bytes:
-    """Cifra a K_adm da versão V para um membro ativo (ECIES, info FED-DIRKEY-v1)."""
-    return ecies_encrypt(member_pub, k_adm, info=INFO_DIRKEY, associated_data=_u32(version))
+def wrap_k_adm(member_pub: rsa.RSAPublicKey, k_adm: bytes, version: int) -> bytes:
+    """Cifra a K_adm da versão V para um membro ativo (RSA-OAEP, label FED-KADM-v1 + V)."""
+    if len(k_adm) != 32:
+        raise ValueError("A K_adm tem de ter 32 bytes.")
+    return rsa_oaep_encrypt(member_pub, k_adm, label=_kadm_label(version))
 
 
-def unwrap_k_adm(member_sk: x25519.X25519PrivateKey, wrapped: bytes, version: int) -> bytes:
+def unwrap_k_adm(member_sk: rsa.RSAPrivateKey, wrapped: bytes, version: int) -> bytes:
     """Decifra a K_adm da versão V."""
-    return ecies_decrypt(member_sk, wrapped, info=INFO_DIRKEY, associated_data=_u32(version))
+    k_adm = rsa_oaep_decrypt(member_sk, wrapped, label=_kadm_label(version))
+    if len(k_adm) != 32:
+        raise ValueError("K_adm decifrada com tamanho inválido.")
+    return k_adm
 
 
 # --- Assinatura de relatórios e corroborações (sk_E) ---
@@ -622,7 +669,7 @@ def verify_corroboration(pk_E, epoch_id: int, version: int, rid: bytes, cipherte
 # --- Diretório de membros (Coordinator) ---
 
 def create_directory_message(version: int, member_pubkeys: list[bytes]) -> bytes:
-    """Mensagem do diretório V: versão e lista das chaves públicas de cifra dos membros ativos."""
+    """Mensagem do diretório V: versão e lista das chaves públicas RSA (DER) dos membros ativos."""
     msg = DOMAIN_DIRECTORY + _u32(version)
     msg += struct.pack(">I", len(member_pubkeys))
     for pub in member_pubkeys:
@@ -679,8 +726,8 @@ def derive_epoch_key(chain_key: bytes) -> Tuple[ed25519.Ed25519PrivateKey, bytes
     """
     if len(chain_key) != 32:
         raise ValueError("A chave da cadeia tem de ter 32 bytes.")
-    sk_seed = _hkdf32(chain_key, INFO_CHAIN_KEY)
-    next_ck = _hkdf32(chain_key, INFO_CHAIN_NEXT)
+    sk_seed = _hkdf32(chain_key, HKDF_CHAIN_KEY)
+    next_ck = _hkdf32(chain_key, HKDF_CHAIN_NEXT)
     return ed25519.Ed25519PrivateKey.from_private_bytes(sk_seed), next_ck
 
 

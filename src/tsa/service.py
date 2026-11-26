@@ -1,10 +1,16 @@
-"""Serviço HTTP da TSA (FastAPI). Recebe um hash e devolve o token.
+"""Serviço HTTP da TSA (FastAPI), RFC 3161 sobre HTTP (RFC 3161, secção 3.4).
 
-Arranque (TLS mútuo, sem logs de acesso):
+`POST /v1/timestamp` com corpo `application/timestamp-query` (TimeStampReq DER) devolve
+`application/timestamp-reply` (TimeStampResp DER).
 
-    FED_TSA_KEY=data/tsa/tsa.key FED_TSA_CERT=data/tsa/tsa.pem FED_TSA_STATE=data/tsa/state.json \\
+Arranque (TLS mútuo, sem logs de acesso, um único processo por causa do ficheiro de serial).
+O certificado TLS é um certificado de servidor próprio: o da TSA tem só a EKU timeStamping
+e não serve para TLS.
+
+    FED_TSA_KEY=data/tsa/tsa.key FED_TSA_CERT=data/tsa/tsa.pem FED_TSA_STATE=data/tsa/state \\
+    FED_TSA_KEY_PASSPHRASE=... \\
     uvicorn --factory src.tsa.service:app_from_env --no-access-log \\
-        --ssl-keyfile data/tsa/tsa.key --ssl-certfile data/tsa/tsa.pem \\
+        --ssl-keyfile data/tsa/tls.key --ssl-certfile data/tsa/tls.pem \\
         --ssl-ca-certs data/ca/ca.cert.pem --ssl-cert-reqs 2
 
 A TSA só vê um hash: nunca o conteúdo nem a identidade de quem reporta.
@@ -12,42 +18,31 @@ A TSA só vê um hash: nunca o conteúdo nem a identidade de quem reporta.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import os
+from fastapi import FastAPI, HTTPException, Request, Response
+from starlette.concurrency import run_in_threadpool
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from src.tsa.tsa import MAX_REQUEST_LEN, TimestampAuthority, TSAError, load_from_env
 
-from src.tsa.tsa import IMPRINT_LEN, MAX_NONCE_LEN, TimestampAuthority, TSAError
-
-
-class StampRequest(BaseModel):
-    imprint: str = Field(description="SHA-256 do envelope, em base64")
-    nonce: str | None = Field(default=None, description="nonce opcional, em base64")
-
-
-def _b64(value: str, name: str, max_len: int) -> bytes:
-    try:
-        raw = base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=f"{name} não é base64 válido") from exc
-    if len(raw) > max_len:
-        raise HTTPException(status_code=400, detail=f"{name} demasiado longo")
-    return raw
+QUERY_TYPE = "application/timestamp-query"
+REPLY_TYPE = "application/timestamp-reply"
 
 
 def create_app(tsa: TimestampAuthority) -> FastAPI:
     app = FastAPI(title="TSA da federação", docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.post("/v1/timestamp")
-    def timestamp(req: StampRequest) -> dict:
-        imprint = _b64(req.imprint, "imprint", IMPRINT_LEN)
-        nonce = _b64(req.nonce, "nonce", MAX_NONCE_LEN) if req.nonce else None
+    async def timestamp(request: Request) -> Response:
+        content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type != QUERY_TYPE:
+            raise HTTPException(status_code=415, detail=f"Content-Type tem de ser {QUERY_TYPE}")
+        body = await request.body()
+        if len(body) > MAX_REQUEST_LEN:
+            raise HTTPException(status_code=413, detail="Pedido demasiado longo")
         try:
-            return tsa.stamp(imprint, nonce).to_dict()
+            reply = await run_in_threadpool(tsa.stamp, body)  # o openssl bloqueia
         except TSAError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return Response(content=reply, media_type=REPLY_TYPE)
 
     @app.get("/health")
     def health() -> dict:
@@ -57,7 +52,4 @@ def create_app(tsa: TimestampAuthority) -> FastAPI:
 
 
 def app_from_env() -> FastAPI:
-    tsa = TimestampAuthority.load(
-        os.environ["FED_TSA_KEY"], os.environ["FED_TSA_CERT"], os.environ["FED_TSA_STATE"],
-        passphrase=os.environ.get("FED_TSA_KEY_PASSPHRASE"))
-    return create_app(tsa)
+    return create_app(load_from_env())

@@ -5,7 +5,7 @@ flowchart TB
         CKN["Cadeia CK_E+1"]
         SKE["sk_E e pk_E<br/>par Ed25519 da época E (12 h)"]
         CRED["Credencial da época E<br/>com cofre em duas camadas"]
-        SKENC["sk_enc (X25519)<br/>decifra as chaves de conteúdo"]
+        SKENC["sk_enc (RSA-3072)<br/>decifra as chaves de conteúdo"]
         KC["K_c<br/>chave aleatória por mensagem"]
         KADM["K_adm da versão V<br/>HMAC de admissão"]
     end
@@ -34,8 +34,8 @@ flowchart TB
     C --> KADMC
     C --> VAULTC
     DIR -->|"lista de destinatários, via control"| KC
-    KC -->|"ECIES para cada membro do diretório, no envelope"| SKENC
-    KADMC -->|"ECIES para cada membro ativo, via control"| KADM
+    KC -->|"RSA-OAEP para cada membro do diretório, no envelope"| SKENC
+    KADMC -->|"RSA-OAEP para cada membro ativo, via control"| KADM
     KADMC -->|"só esta chave"| G
     KADM -->|"HMAC em cada envelope"| G
     A -->|"disputa procedente: pede remoção da camada exterior"| C

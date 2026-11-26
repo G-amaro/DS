@@ -1,0 +1,7 @@
+# Dependências Python. Requer também OpenSSL >= 3 no PATH (ou FED_OPENSSL) para a TSA RFC 3161.
+cryptography>=42
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2
+httpx[socks]>=0.27
+pytest>=8
